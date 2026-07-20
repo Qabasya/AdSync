@@ -8,7 +8,6 @@ from models import (
     ActiveUsernamesResponse,
     DeprovisionJob,
     JobsResponse,
-    PromoteJob,
     ProvisionJob,
 )
 
@@ -28,18 +27,6 @@ def test_provision_job_parses_from_raw_payload() -> None:
     )
     assert job.username == "i.petrov"
     assert job.subject_key == "inf"
-
-
-def test_promote_job_parses_from_raw_payload() -> None:
-    job = PromoteJob.model_validate(
-        {
-            "id": 9,
-            "event": "promote",
-            "idempotency_key": "promote:person:3",
-            "username": "p.orlov",
-        }
-    )
-    assert job.username == "p.orlov"
 
 
 def test_deprovision_job_parses_from_raw_payload() -> None:
@@ -74,18 +61,11 @@ def test_jobs_response_resolves_mixed_list_by_discriminator() -> None:
                     "idempotency_key": "deprovision:app:9",
                     "username": "a.sidorov",
                 },
-                {
-                    "id": 9,
-                    "event": "promote",
-                    "idempotency_key": "promote:person:3",
-                    "username": "p.orlov",
-                },
             ]
         }
     )
     assert isinstance(response.jobs[0], ProvisionJob)
     assert isinstance(response.jobs[1], DeprovisionJob)
-    assert isinstance(response.jobs[2], PromoteJob)
 
 
 def test_unknown_event_raises_validation_error() -> None:

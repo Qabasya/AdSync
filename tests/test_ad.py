@@ -1,5 +1,7 @@
 """Тесты `AdGateway` (`ad.py`) на `ldap3` `MOCK_SYNC` — без сети, без реального AD."""
 
+from datetime import UTC, datetime
+
 import pytest
 from ldap3 import BASE, MOCK_SYNC, Connection, Server
 from ldap3.core.exceptions import LDAPSocketOpenError
@@ -223,3 +225,48 @@ def test_reconnect_retries_once_after_communication_error() -> None:
     assert reconnect_calls == 1
     assert user is not None
     assert user.dn == user_dn
+
+
+def test_list_zone_accounts_covers_zone_and_fallback_excludes_disabled_and_outside() -> None:
+    connection = _make_connection()
+    gateway = _make_gateway(connection)
+    connection.strategy.add_entry(
+        f"CN=Subject User,{SUBJECT_OU}",
+        {
+            "objectClass": ["user"],
+            "sAMAccountName": "subject-user",
+            "userAccountControl": 512,
+            "whenCreated": b"20200101000000.0Z",
+        },
+    )
+    connection.strategy.add_entry(
+        f"CN=Fallback User,{OU_FALLBACK}",
+        {
+            "objectClass": ["user"],
+            "sAMAccountName": "fallback-user",
+            "userAccountControl": 514,
+            "whenCreated": b"20210605120000Z",
+        },
+    )
+    connection.strategy.add_entry(
+        f"CN=Disabled User,{OU_DISABLED}",
+        {
+            "objectClass": ["user"],
+            "sAMAccountName": "disabled-user",
+            "userAccountControl": 514,
+            "whenCreated": b"20200101000000.0Z",
+        },
+    )
+
+    accounts = gateway.list_zone_accounts()
+
+    usernames = {account.username for account in accounts}
+    assert usernames == {"subject-user", "fallback-user"}
+
+    subject_account = next(a for a in accounts if a.username == "subject-user")
+    assert subject_account.enabled is True
+    assert subject_account.created_at == datetime(2020, 1, 1, tzinfo=UTC)
+
+    fallback_account = next(a for a in accounts if a.username == "fallback-user")
+    assert fallback_account.enabled is False
+    assert fallback_account.created_at == datetime(2021, 6, 5, 12, 0, 0, tzinfo=UTC)

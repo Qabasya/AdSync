@@ -75,7 +75,8 @@ pydantic v2), обсудим при первом реальном расхожд
 - `class Settings(BaseSettings)` — поля по таблице Configuration CLAUDE.md, чтение из `.env`
   (`model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")`):
   - `lms_base_url: str`, `fs_lms_ad_hmac_secret: str` — обязательные, без дефолта.
-  - `jobs_poll_seconds: int = 3`, `jobs_limit: int = Field(50, ge=1, le=100)`.
+  - `jobs_poll_seconds: int = 3`, `jobs_limit: int = Field(50, ge=1, le=200)` (диапазон расширен до
+    200 позже, при сверке с `.docs/FS_LMS_API.md` — контракт fs-lms сам допускает до 200).
   - `reconcile_interval_hours: int = 6`, `reconcile_grace_minutes: int = 15`,
     `reconcile_max_disable: int = 10`, `reconcile_max_disable_pct: int = Field(20, ge=0, le=100)`.
   - `ldap_host: str = "11.11.11.11"`, `ldap_port: int = 636`,
@@ -84,8 +85,9 @@ pydantic v2), обсудим при первом реальном расхожд
   - `ad_upn_suffix: str = "fs.loc"`, `ad_ou_disabled: str`, `ad_ou_fallback: str` — обязательные.
   - `subjects_file: Path = Path("/app/config/subjects.yaml")`, `data_dir: Path = Path("/data")`.
   - `tz_name: str = "Europe/Moscow"`, `daily_summary_time: str | None = None`.
-  - `loki_url: str | None = None`, `telegram_bot_token: str | None = None`,
-    `telegram_chat_id: str | None = None`.
+  - `loki_url: str | None = None` (`telegram_bot_token`/`telegram_chat_id` изначально были здесь
+    же — убраны на этапе 8, когда пользователь пояснил, что мессенджер-алертинг будет через
+    Grafana Alerting поверх Loki, а не прямым пушем из сервиса).
   - `api_port: int = 8091`.
   - Имена полей в `snake_case` — pydantic-settings сопоставляет их с переменными окружения в
     `UPPER_SNAKE_CASE` без доп. алиасов (регистронезависимо).
@@ -501,3 +503,563 @@ uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
 ```
 
 Зависимости новые не нужны.
+
+---
+
+## Этап 6 — Поллер заданий
+
+`poller.py` — цикл заданий: `fetch → dispatch → ack → журнал`, последовательно, один поток
+(раздел Job Processing Rules CLAUDE.md). Про AD/LDAP не знает — только `LmsApi`, реестр
+`JobHandler` и `JobRepository`. Про потоки/`while not stop.wait(...)`/SIGTERM не знает — это
+`main.py` (этап 9); `poller.py` даёт один метод «прогнать один тик».
+
+### Файлы
+
+| Файл | Статус | Роль |
+|---|---|---|
+| `src/poller.py` | новый | `Poller`: один тик обработки заданий |
+| `tests/fakes.py` | правка | `FakeLmsApi` — опциональная имитация сетевых ошибок `get_jobs`/`ack` |
+| `tests/test_poller.py` | новый | покрытие `Poller` на `FakeLmsApi` + реальных обработчиках/`FakeDirectoryGateway` + `JobRepository` на `tmp_path` |
+
+### `src/poller.py`
+
+- `class Poller`:
+  - `__init__(self, lms: LmsApi, *, handlers: dict[str, JobHandler], repository: JobRepository,
+    jobs_limit: int, now: Callable[[], datetime]) -> None` — `now` внедряется зависимостью (как
+    того требует раздел Code Style CLAUDE.md), `repository.record()` сам с датой/временем не
+    работает (см. `repository.py`, этап 2).
+  - `def run_once(self) -> None`:
+    1. `received_at = self._now()`; `jobs = self._lms.get_jobs(self._jobs_limit)` — любое
+       исключение (сеть, `httpx.HTTPStatusError`, `pydantic.ValidationError` при невалидном
+       задании в списке — весь список валидируется атомарно, см. ниже «Известное отклонение») →
+       `logger.error(...)`, тик завершается, ack никому не шлётся, цикл не падает.
+    2. Для каждого `job` из `jobs` — `self._process(job, received_at)`; ошибка одного задания не
+       прерывает обработку остальных.
+  - `def _process(self, job: Job, received_at: datetime) -> None`:
+    1. `handler = self._handlers.get(job.event)`; если обработчика нет (бага реестра в
+       `main.py`) — `HandlerResult("failed", error=f"нет обработчика для {job.event!r}")` без
+       попытки вызова.
+    2. Иначе — вызов `handler.handle(job)` в `try/except Exception`; исключение (LDAP-ошибка,
+       `OutsideManagedZoneError` и т.п.) → `logger.exception(...)` (без вывода самого `job` целиком
+       — только `job.id`/`job.event`/`job.username`, пароль в лог никогда не должен попасть) →
+       `HandlerResult("failed", error=str(exc))`.
+    3. `acked_at = self._now()`; `self._lms.ack(AckRequest(id=job.id, status=result.status,
+       error=result.error))` в `try/except Exception` — сбой самого ack (сеть) →
+       `logger.error(...)`, **запись в журнал не делается** (WP ack не получил — само задание
+       естественным образом переотдастся на следующий опрос, штатный pull-ретрай), выходим без
+       падения.
+    4. Ack прошёл → `subject_key = job.subject_key if isinstance(job, ProvisionJob) else None` →
+       `repository.record(JobLogEntry(job_id=job.id, idempotency_key=job.idempotency_key,
+       event=job.event, username=job.username, subject_key=subject_key, status=result.status,
+       error=result.error, received_at=received_at, acked_at=acked_at))`.
+    5. Если `result.status == "failed"` — `dead = repository.dead_count(job.idempotency_key)`;
+       `dead >= 6` (порог из раздела Dead CLAUDE.md) → `logger.error(...)` («задание мертво»).
+       Настоящий `Notifier.job_dead(...)` подключится, когда появится `notifier.py` — пока это
+       единственный сигнал, аналогично `unknown_subject` в `handlers.py` (этап 5).
+  - Логгер модуля: `logging.getLogger("adsync.poller")`.
+
+**Известное отклонение**: правило «невалидное задание → `failed` + ERROR, без попытки обработки»
+трактуется на уровне **всего тика**, а не отдельного задания — `JobsResponse.model_validate(...)`
+в `lms.py` (этап 3) валидирует список атомарно, отдельное невалидное задание нельзя выделить и
+поднять ack по нему без переработки `models.py`/`lms.py` (не входит в этот этап). На практике:
+один битый элемент в ответе роняет `get_jobs()` целиком → весь тик логируется как ERROR и штатно
+повторяется на следующем цикле, сервис не падает — соответствует духу правила («не пытаться
+обработать»), но не даёт ack по конкретному сломанному заданию.
+
+### `tests/fakes.py` — правка `FakeLmsApi`
+
+- Добавить опциональные поля конструктора `get_jobs_error: Exception | None = None`,
+  `ack_error: Exception | None = None`; если заданы — соответствующий метод бросает это исключение
+  вместо обычной работы. Нужно только сейчас (тесты сетевых сбоев поллера) — до этого фейку это не
+  требовалось (см. память проекта об инкрементальном усложнении фейков по мере надобности).
+
+### Тесты (`tests/test_poller.py`)
+
+- Смешанный тик (`provision`/`promote`/`deprovision`) — по каждому уходит `ack` с ожидаемым
+  статусом; в журнале (читаем сырым `sqlite3.connect`, как в `test_repository.py`) — по строке на
+  задание, `subject_key` заполнен только у `provision`, `NULL` у `promote`/`deprovision`.
+  `received_at`/`acked_at` — валидные ISO-таймстемпы из подставленного `now`.
+- Обработчик бросает исключение на одном из заданий пачки → `ack(failed, error=...)` по нему,
+  журнал получает `status='failed'` с текстом ошибки, **следующее задание пачки всё равно
+  обработано** (изоляция ошибок).
+- `get_jobs` бросает исключение (`FakeLmsApi(get_jobs_error=...)`) → `run_once()` не падает, `ack`
+  не вызывается ни разу, журнал пуст, ошибка залогирована (`caplog`, ERROR).
+- `ack` бросает исключение на конкретном задании (`FakeLmsApi(ack_error=...)`) →
+  `run_once()` не падает, в журнале для этого задания записи нет (ack не подтверждён), ERROR
+  залогирован.
+- Dead-порог: журнал предзаполнен 5 записями `status='failed'` с одним `idempotency_key`; тик,
+  где обработчик для задания с этим же `idempotency_key` снова падает (6-я неудача) →
+  `logger.error` про «мёртвое» задание (`caplog`), обработка при этом не падает.
+- Нет обработчика для `job.event` в реестре (пустой `handlers={}`) → `ack(failed, ...)` с понятной
+  причиной, журнал получает `status='failed'`, без падения.
+
+### Проверка перед завершением этапа
+
+```
+uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
+```
+
+Зависимости новые не нужны.
+
+## Этап 7 — Сверка (reconcile)
+
+Раздел «Сверка (reconcile)» CLAUDE.md требует перечислить **все** активные учётки управляемой
+зоны (OU направлений + `AD_OU_FALLBACK`, без `AD_OU_DISABLED`) и сравнить с авторитетным списком
+от WP. У `DirectoryGateway` (этап 4) такого группового перечисления нет — только точечный
+`find_user(username)`. Разведка (сделано): `ldap3` `MOCK_SYNC` **не** заполняет `whenCreated`
+автоматически при `add()` (в отличие от настоящего AD) — значение `<no value>` (`None` в
+`.value`); в тестах его нужно сеять вручную через `connection.strategy.add_entry(...)` байтовой
+строкой формата `GeneralizedTime` (`b"20260701100000.0Z"`), как остальные преднаселённые объекты
+в `_make_connection`. Поэтому парсинг `whenCreated` в `ad.py` не полагается на автоформатирование
+`ldap3` (оно недоступно в `MOCK_SYNC` и зависит от online-схемы на настоящем AD), а сделан вручную
+регэкспом по строке — одинаково работает и в тестах, и в проде.
+
+### Файлы
+
+| Файл | Статус | Роль |
+|---|---|---|
+| `src/ad.py` | правка | `ZoneAccount` (dataclass) + `DirectoryGateway.list_zone_accounts()` + `AdGateway` реализация |
+| `src/reconcile.py` | новый | `Reconciler` — сверка с предохранителями |
+| `tests/fakes.py` | правка | `FakeDirectoryGateway.list_zone_accounts()` + `created_at` для `create_user()` |
+| `tests/test_ad.py` | правка | тест на `list_zone_accounts` (зона/fallback/исключение «Отчисленных», парсинг `whenCreated`) |
+| `tests/test_reconcile.py` | новый | покрытие `Reconciler`: happy path, все предохранители, grace, односторонность |
+
+### `src/ad.py` (правка)
+
+- `@dataclass(frozen=True, slots=True) class ZoneAccount` — `dn: str`, `username: str`,
+  `enabled: bool`, `created_at: datetime`. Отдельный тип от `DirectoryUser` — разное назначение
+  (точечный поиск по имени vs. массовое перечисление зоны с датой создания для grace-периода), не
+  расширяем `DirectoryUser` ради одного потребителя.
+- `DirectoryGateway.list_zone_accounts(self) -> list[ZoneAccount]` — перечисляет все учётки во
+  всех `ou_dn` направлений + `ou_fallback` (без `ou_disabled` — «вне сверки» по CLAUDE.md).
+- `AdGateway`:
+  - `self._reconcile_ou_dns` в `__init__` — `sorted({s.ou_dn for s in subjects.values()} |
+    {ou_fallback})` (дедуп: разные `subject_key` могут вести в одну OU).
+  - `list_zone_accounts()` — по каждой OU из `_reconcile_ou_dns`: `search(ou_dn,
+    "(objectClass=user)", SUBTREE, attributes=["sAMAccountName", "userAccountControl",
+    "whenCreated"])` через `self._run`; строит `ZoneAccount` по каждой записи; дедуп по `dn`
+    (`dict[str, ZoneAccount]`) на случай пересекающихся OU в конфиге.
+  - `_parse_when_created(value: object) -> datetime` — модульная функция: регэксп
+    `^(\d{14})(?:\.\d+)?Z$` по `str(value)` (формат `GeneralizedTime` AD, дробная часть
+    секунд опциональна), `strptime(..., "%Y%m%d%H%M%S")` → `.replace(tzinfo=UTC)`; неожиданный
+    формат/`None` → `ValueError` с сырым значением в сообщении (не глотается молча).
+
+### `src/reconcile.py`
+
+- `@dataclass(frozen=True, slots=True) class ReconcileResult` — `disabled_usernames:
+  tuple[str, ...]`, `aborted: bool`, `abort_reason: str | None = None`. Возврат `run_once()` —
+  для логов/тестов/будущей дневной сводки (этап 8, если понадобится).
+- `class Reconciler`:
+  - `__init__(self, lms: LmsApi, directory: DirectoryGateway, *, ou_disabled: str, max_disable:
+    int, max_disable_pct: int, grace_minutes: int, now: Callable[[], datetime]) -> None`.
+  - `def run_once(self) -> ReconcileResult`:
+    1. `zone_accounts = self._directory.list_zone_accounts()`.
+    2. `self._lms.get_active_usernames()` в `try/except Exception` → сбой сети/парсинга →
+       `logger.exception(...)`, `ReconcileResult((), aborted=True, abort_reason=...)`, никого не
+       трогаем (тот же принцип «не уверен — не действуй», что и остальные предохранители).
+    3. Предохранитель 1 (порядок — по CLAUDE.md): `active_usernames` пуст **и** `zone_accounts` не
+       пуст → abort, `logger.error(...)`.
+    4. `grace_cutoff = self._now() - timedelta(minutes=self._grace_minutes)`; `stale = [a for a in
+       zone_accounts if a.username not in active_usernames and a.created_at < grace_cutoff]` —
+       молодые учётки (`created_at >= grace_cutoff`) из `stale` исключаются целиком, не считаются
+       нигде дальше.
+    5. Предохранитель 2: `len(stale) > max_disable` → abort, `logger.error(...)`.
+    6. Предохранитель 3: `len(stale) * 100 > max_disable_pct * len(zone_accounts)` → abort,
+       `logger.error(...)`.
+    7. Иначе — по каждой `stale`-учётке: `directory.ensure_disabled(dn)` →
+       `directory.move_to_ou(dn, ou_disabled)` (тот же путь, что `DeprovisionHandler`, но без
+       журнала — у сверки нет `job_id`/`idempotency_key` от WP, это не про обработку задания).
+       Возврат `ReconcileResult(disabled_usernames=tuple(usernames), aborted=False)`.
+  - Всегда **односторонне**: ни при каком исходе `ensure_enabled`/`create_user`/перенос обратно не
+    вызываются — метода для этого у `Reconciler` просто нет.
+  - `Notifier.reconcile_aborted(...)` — хук добавится вместе с `notifier.py` (не в этом этапе);
+    пока абort фиксируется только `logger.error(...)`, аналогично `unknown_subject` (этап 5) и
+    dead-порогу (этап 6).
+  - Логгер модуля: `logging.getLogger("adsync.reconcile")`.
+- Про запись в `JobRepository` сознательно не идёт речи: сверка — не обработка задания WP, у неё
+  нет `job_id`/`idempotency_key`; если для дневной сводки (этап 8) понадобится считать
+  reconcile-отключения — добавим там, а не заранее.
+
+### `tests/fakes.py` — правка `FakeDirectoryGateway`
+
+- `create_user(..., created_at: datetime | None = None)` — сохраняет в `self.created_at: dict[str,
+  datetime]` (дефолт — заведомо старая дата, например `datetime(2000, 1, 1, tzinfo=UTC)`, чтобы по
+  умолчанию учётки не попадали под grace-защиту).
+- `list_zone_accounts(self) -> list[ZoneAccount]` — по `users_by_username`: включает запись, если
+  `is_in_managed_zone(dn)` и **не** `is_in_disabled_ou(dn)`; `created_at` берётся из
+  `self.created_at[username]`.
+
+### Тесты
+
+`tests/test_ad.py` (доп.):
+- `list_zone_accounts` возвращает учётки из OU направления и `ou_fallback`, не возвращает учётку из
+  `ou_disabled` и учётку вне зоны; `whenCreated`, засеянный как
+  `b"20200101000000.0Z"` напрямую через `connection.strategy.add_entry`, разбирается в
+  `datetime(2020, 1, 1, tzinfo=UTC)`.
+
+`tests/test_reconcile.py` (на `FakeDirectoryGateway` + `FakeLmsApi`, без сети):
+- happy path: в зоне 3 учётки, WP подтверждает 2 → третья отключена и перенесена в
+  `ou_disabled`, `ReconcileResult.disabled_usernames == ("third",)`, `aborted is False`.
+- сверка ничего не отключает, если все учётки зоны подтверждены WP.
+- предохранитель «пустой список при непустой зоне»: `active_usernames=[]`, зона не пуста → abort,
+  никто не тронут.
+- предохранитель `RECONCILE_MAX_DISABLE`: к отключению больше порога → abort, никто не тронут.
+- предохранитель `RECONCILE_MAX_DISABLE_PCT`: к отключению больше процента зоны → abort.
+- grace: учётка младше `RECONCILE_GRACE_MINUTES` (свежий `created_at` относительно
+  подставленного `now`) отсутствует в списке WP, но не отключается и не считается в предохранителях
+  как «к отключению».
+- `get_active_usernames` бросает исключение → `aborted=True`, `ERROR` в логе (`caplog`), никто не
+  тронут.
+- односторонность: после успешного прогона ни разу не вызывается `ensure_enabled`/`create_user` (у
+  `FakeDirectoryGateway` это проверяется, например, отсутствием изменений `enabled=True` там, где
+  не ожидалось).
+
+### Проверка перед завершением этапа
+
+```
+uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
+```
+
+Зависимости новые не нужны.
+
+---
+
+## Этап 8 — Логирование и дневная сводка
+
+**Пересмотрено по ходу этапа**: изначально планировался отдельный `notifier.py` (`Notifier`
+Protocol + `TelegramNotifier` с явными методами `job_dead`/`unknown_subject`/
+`reconcile_aborted`/`daily_summary`) как второй канал уведомлений параллельно логам. Пользователь
+поправил подход: канал один — обычный `logging`. Успешные операции, предупреждения и ошибки идут
+через `logger.<level>(...)` по всему коду; Telegram — не отдельная бизнес-абстракция, а просто
+хендлер логов на уровне `ERROR`+ поверх того же потока (`logging_setup.py`, уже реализован в
+исходной редакции этапа и не меняется по сути). `notifier.py`, `Notifier` Protocol,
+`TelegramNotifier`, `FakeNotifier` и вся связанная проводка через `handlers.py`/`poller.py`/
+`reconcile.py` — удаляются. `.docs/CLAUDE.md` (разделы Logging & Notifications, SOLID/I,D,
+Architecture, Testing, Strict Rules) обновлён под эту модель.
+
+Остаётся актуальным: тонкий агрегат-метод в `repository.py` для дневной сводки (обещан ещё в
+этапе 2), и три места из этапов 5–7, где раньше был только `logger.warning`/`logger.error` —
+теперь дополнительно нужны **INFO-логи на успешные пути** (их не было вообще), а прежние
+warning/error остаются как есть (просто без вызова `Notifier`, которого больше нет).
+
+**Известное решение**: планировка дневной сводки (сравнение текущего времени с
+`DAILY_SUMMARY_TIME`, разовый вызов раз в сутки) — не в этом этапе, это `main.py` (этап 9,
+третий таймер поверх двух daemon-потоков). Здесь только `JobRepository.daily_counts(since)`;
+`main.py` в конце вызовет его и запишет один `logger.info(...)` с числами.
+
+**Известное отклонение**: `daily_counts` считает `disabled` только по журналу WP-заданий
+(`event='deprovision', status='done'`) — отключения, сделанные `reconcile.py` (этап 7), туда не
+попадают: у сверки нет `job_id`/`idempotency_key`, её результаты сознательно не пишутся в `jobs`
+(см. этап 7). Массовые reconcile-отключения и так видны как `ERROR` в логе при abort и `INFO` при
+обычном отключении; заводить отдельный счётчик под сводку — не в рамках этого этапа.
+
+**Пересмотрено повторно**: изначально `logging_setup.py` дополнительно содержал
+`TelegramLogHandler` (прямой пуш `ERROR`+ записей в Telegram Bot API из кода сервиса, с
+флуд-защитой). Пользователь пояснил инфраструктуру: два сервиса в отдельных контейнерах пишут в
+общий Loki (третий контейнер), поверх которого — Grafana с дашбордом; оповещение в мессенджер,
+если понадобится, будет настроено как Grafana Alerting (LogQL-правило по `level="error"` +
+Telegram contact point), а не прямым пушем из приложения. `TelegramLogHandler` и параметры
+`telegram_bot_token`/`telegram_chat_id`/`now` в `configure_logging` — убраны; `TELEGRAM_BOT_TOKEN`/
+`TELEGRAM_CHAT_ID` убраны из `Settings`, `.env.example`, `.docs/CLAUDE.md`. `logging_setup.py`
+теперь строго про file + Loki + redaction — без knowledge о мессенджерах.
+
+### Файлы
+
+| Файл | Статус | Роль |
+|---|---|---|
+| `src/logging_setup.py` | новый | `RedactionFilter`, `LokiHandler`, `configure_logging()` (file + Loki) |
+| `src/repository.py` | правка | `DailyCounts` (dataclass) + `JobRepository.daily_counts(since)` |
+| `src/config.py` | правка | `Settings` без `telegram_bot_token`/`telegram_chat_id` |
+| `src/handlers.py` | правка | `ProvisionHandler`/`PromoteHandler`/`DeprovisionHandler` — INFO-логи на успешные пути |
+| `src/poller.py` | правка | `Poller` — INFO-лог на успешную обработку задания |
+| `src/reconcile.py` | правка | `Reconciler` — INFO-лог на успешный прогон (сколько отключено) |
+| `tests/test_logging_setup.py` | новый | покрытие `RedactionFilter`, `LokiHandler`, монтаж `configure_logging` |
+| `tests/test_repository.py` | правка | тест на `daily_counts` |
+| `tests/test_handlers.py`, `tests/test_poller.py`, `tests/test_reconcile.py` | правка | новые ассерты на INFO-логи (`caplog`) вместо `FakeNotifier` |
+
+### `src/logging_setup.py`
+
+- `_SENSITIVE_PATTERN = re.compile(r"(?i)(password|unicodePwd)=(?:'[^']*'|\"[^\"]*\"|\S+)")`.
+- `class RedactionFilter(logging.Filter)`:
+  - `def filter(self, record: logging.LogRecord) -> bool` — берёт `record.getMessage()`
+    (уже подставленные `%`-аргументы), прогоняет через `_SENSITIVE_PATTERN.sub(...)`
+    (`password=***`); если текст изменился — `record.msg = redacted`, `record.args = ()` (иначе
+    хендлер попытается повторно подставить аргументы в уже готовую строку); возвращает `True`
+    всегда (не режет записи, только чистит текст). Навешивается на **каждый** хендлер
+    (`handler.addFilter(...)`) в `configure_logging`, а не на логгер — фильтры логгера-предка не
+    применяются к записям от логгеров-потомков при штатном распространении, только фильтры самого
+    хендлера гарантированно видят все записи независимо от исходного `adsync.<module>`.
+- `class LokiHandler(logging.Handler)`:
+  - `__init__(self, loki_url: str, *, service: str = "fs-adsync", transport:
+    httpx.BaseTransport | None = None) -> None` — `httpx.Client(base_url=loki_url, timeout=5.0,
+    transport=transport)`.
+  - `def emit(self, record: logging.LogRecord) -> None` — формат `POST /loki/api/v1/push`:
+    `{"streams": [{"stream": {"service": ..., "level": record.levelname.lower()}, "values":
+    [[str(int(record.created * 1e9)), self.format(record)]]}]}` — лейблы низкокардинальные
+    (`service`, `level`), `username`/`idempotency_key` остаются только в тексте строки (в теле
+    `values`), не в `stream`-лейблах, как требует раздел Logging CLAUDE.md; сбой отправки →
+    `self.handleError(record)` (стандартный идиом `logging.Handler`, не роняет процесс).
+  - `def close(self) -> None` — закрывает `httpx.Client`, зовёт `super().close()`.
+- `def configure_logging(*, data_dir: Path, loki_url: str | None, level: int = logging.INFO) -> None`:
+  - Логгер `logging.getLogger("adsync")`: `setLevel(level)`, `propagate = False` (все хендлеры
+    висят прямо на нём, дублировать через root не нужно).
+  - `RotatingFileHandler(data_dir / "logs" / "adsync.log", maxBytes=10 * 1024 * 1024,
+    backupCount=5, encoding="utf-8")` — всегда добавляется.
+  - `LokiHandler(loki_url)` — добавляется, только если `loki_url` задан.
+  - На каждый добавленный хендлер — свой `Formatter("%(asctime)s %(levelname)s %(name)s:
+    %(message)s")` и общий экземпляр `RedactionFilter()` (`handler.addFilter(...)`).
+
+### `src/repository.py` (правка)
+
+- `@dataclass(frozen=True, slots=True) class DailyCounts` — `created: int`, `disabled: int`,
+  `errors: int`.
+- `JobRepository.daily_counts(self, since: datetime) -> DailyCounts` — один `SELECT` с тремя
+  `SUM(CASE WHEN ... THEN 1 ELSE 0 END)` по `jobs WHERE acked_at >= ?` (`since.isoformat()`):
+  `created` = `event='provision' AND status='done'`, `disabled` = `event='deprovision' AND
+  status='done'`, `errors` = `status='failed'` (любой `event`). Сравнение `acked_at` (ISO 8601
+  UTC-строка) через `>=` корректно лексикографически, т.к. формат всегда одинаковый (см.
+  `record()`, этап 2).
+
+### `src/handlers.py` (правка)
+
+- `ProvisionHandler.handle`: `logger.info(...)` на каждом успешном исходе, с указанием, какая
+  именно ветка сработала — новая учётка (`создана учётка %s в %s`), реактивация из «Отчисленных»
+  (`реактивирована учётка %s: %s → %s`), обновление уже существующей в зоне (`обновлена учётка %s
+  в зоне`). Ветка неизвестного `subject_key` — как раньше, `logger.warning(...)`, без вызова
+  `Notifier` (его больше нет).
+- `PromoteHandler.handle`: `logger.info("promote %s: всё на месте", job.username)` на `done`.
+- `DeprovisionHandler.handle`: `logger.info(...)` на `done` — отдельно для «уже не было учётки»,
+  «уже была отключена» и «отключена и перенесена сейчас» (разный смысл, один уровень).
+- Ветки `failed` (вне зоны и т.п.) — как раньше, `logger.error(...)`, без изменений в логике.
+
+### `src/poller.py` (правка)
+
+- `_process`: `logger.info("задание %s (%s) для %s обработано: %s", job.id, job.event,
+  job.username, result.status)` после успешной записи в журнал (после `repository.record(...)`,
+  независимо от `status` — сам факт «дошли до конца без падения» стоит зафиксировать; отдельные
+  `failed`-ветки внутри обработчиков уже дали свой `ERROR` раньше по стеку). Вызов
+  `self._notifier.job_dead(...)` на dead-пороге убирается — остаётся только `logger.error(...)`,
+  как было.
+
+### `src/reconcile.py` (правка)
+
+- `run_once`: перед `return ReconcileResult(tuple(disabled), aborted=False)` — `logger.info("сверка
+  завершена: отключено %d из %d учёток зоны", len(disabled), len(zone_accounts))`.
+- `_abort`: убирается вызов `self._notifier.reconcile_aborted(...)` и сам параметр `notifier` из
+  `__init__` — остаётся только `logger.error("Сверка отменена: %s", reason)`, как было.
+
+### Тесты
+
+`tests/test_logging_setup.py`:
+- `RedactionFilter`: запись с `password='s3cret'` в тексте → в итоговом сообщении `s3cret`
+  отсутствует, есть `password=***`; запись без чувствительных полей не меняется.
+- `LokiHandler` (`MockTransport`): `emit()` шлёт `POST /loki/api/v1/push` с ожидаемыми
+  `stream`-лейблами (`service`, `level`) и текстом строки в `values`; сбой транспорта не роняет
+  вызывающий код (`handleError` перехватывает).
+- `configure_logging` (на `tmp_path`, без реального `loki_url` — чтобы не тестировать реальную
+  сеть): файл лога создаётся по `data_dir/logs/adsync.log`; при `loki_url=None` на логгере
+  `adsync` — только file-хендлер; при заданном `loki_url` — file + Loki.
+
+`tests/test_repository.py` (доп.):
+- `daily_counts`: журнал с записями `provision/done`, `deprovision/done`, `promote/failed` и одной
+  записью **до** `since` — попадает в выборку только то, что `acked_at >= since`; числа совпадают
+  с ожидаемыми по каждой категории.
+
+`tests/test_handlers.py`, `tests/test_poller.py`, `tests/test_reconcile.py` (правка):
+- `FakeNotifier` и связанная проводка из конструкторов убираются;
+- тест неизвестного `subject_key` (`test_handlers.py`) — как раньше, проверяет `caplog` на
+  `WARNING`, без ассертов на `Notifier`;
+- новые ассерты через `caplog.at_level(logging.INFO, ...)`: успешный `provision`/`promote`/
+  `deprovision` (`test_handlers.py`) даёт запись уровня INFO с ожидаемым username; успешная
+  обработка задания в `test_poller.py` даёт INFO после записи в журнал; успешный прогон без abort
+  в `test_reconcile.py` даёт INFO с числом отключённых.
+
+### Проверка перед завершением этапа
+
+```
+uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
+```
+
+Зависимости новые не нужны — `httpx` уже в проекте (этап 0/3).
+
+---
+
+## Этап 9 — Composition root, HTTP API, graceful shutdown
+
+Последний этап функциональности: `main.py` собирает всё построенное на этапах 1–8 в работающий
+процесс — два daemon-потока (`jobs`, `reconcile`) + третий поток дневной сводки (условный, только
+если задан `DAILY_SUMMARY_TIME`) + `uvicorn` с локальным `api.py`. Плюс два тонких read-метода в
+`repository.py` для `/status`, обещанных ещё в этапе 2.
+
+**Решение по потокобезопасности AD-соединения**: `ldap3.Connection` не потокобезопасен для
+конкурентного использования из разных потоков. Вместо добавления блокировок в `ad.py` (что
+затронуло бы уже готовый и протестированный код этапа 4) заводим **два независимых
+`AdGateway`** с двумя отдельными LDAPS-соединениями: один — для `poller`-потока (обработчики
+заданий), другой — для `reconcile`-потока и ручного `POST /reconcile`. Оба строятся одинаково
+(`build_ldaps_connection` по тем же настройкам), `verify_zone_exists()` вызывается один раз (конфиг
+общий — второй раз проверять нечего). Отдельно — `POST /reconcile` может выполниться конкурентно с
+плановым тиком сверки (FastAPI/uvicorn гоняет sync-эндпоинты в своём threadpool): это защищено
+`threading.Lock()` вокруг вызова `reconciler.run_once()`, общего для планового потока и ручного
+запуска.
+
+**Известное решение**: `main.py` не покрывается pytest (нужны реальные LDAPS/uvicorn — то же
+исключение, что у `build_ldaps_connection`, этап 4; раздел Testing CLAUDE.md не требует покрытия
+composition root). Чистая логика (`_seconds_until_next_summary`) вынесена в тестируемую функцию.
+`api.py`, в отличие от `main.py`, тестируется полностью — через `fastapi.testclient.TestClient`
+поверх фейковых зависимостей, без реального `main.py`.
+
+### Файлы
+
+| Файл | Статус | Роль |
+|---|---|---|
+| `src/repository.py` | правка | `StatusCounts` (dataclass) + `JobRepository.status_counts()` / `recent_entries(limit)` |
+| `src/api.py` | новый | `AppState`, `create_api(...)`: `GET /health`, `GET /status`, `POST /reconcile` |
+| `src/main.py` | новый | Composition root: `Settings` → зависимости → потоки → `uvicorn`; graceful shutdown |
+| `tests/test_repository.py` | правка | тесты на `status_counts`/`recent_entries` |
+| `tests/test_api.py` | новый | покрытие `api.py` на `TestClient` + фейковых зависимостях |
+| `tests/test_main.py` | новый | покрытие чистой функции `_seconds_until_next_summary` |
+
+### `src/repository.py` (правка)
+
+- `@dataclass(frozen=True, slots=True) class StatusCounts` — `done: int`, `failed: int`, `dead: int`.
+- `JobRepository.status_counts(self) -> StatusCounts` — `done`/`failed` — суммарные счётчики по
+  всему журналу (`SUM(CASE WHEN status=... THEN 1 ELSE 0 END)`); `dead` — количество **различных**
+  `idempotency_key`, у которых `COUNT(status='failed') >= 6` (тот же порог, что `_DEAD_THRESHOLD` в
+  `poller.py`; константа продублирована как `_DEAD_THRESHOLD = 6` — это фиксированное бизнес-правило
+  из CLAUDE.md, не настройка, дублирование одного числа в двух местах допустимо и не требует общей
+  абстракции).
+- `JobRepository.recent_entries(self, limit: int) -> list[JobLogEntry]` — последние `limit` записей
+  журнала, `ORDER BY id DESC`; собирает `JobLogEntry` из сырых строк (`datetime.fromisoformat` для
+  `received_at`/`acked_at`). Пароля/payload в схеме нет в принципе — фильтровать нечего.
+
+### `src/api.py`
+
+- `@dataclass class AppState` — `last_jobs_poll_at: datetime | None = None`,
+  `last_reconcile_at: datetime | None = None`. Мутируется из `main.py` после каждого тика; читается
+  эндпоинтом `/health`. Простое присваивание одного поля атомарно под GIL — отдельная блокировка не
+  нужна для этих двух независимых полей.
+- Pydantic-модели ответов: `HealthResponse`, `JournalEntryResponse`, `StatusResponse`,
+  `ReconcileResponse` — по контракту раздела HTTP API CLAUDE.md.
+- `def create_api(*, state: AppState, repository: JobRepository, run_reconcile: Callable[[],
+  ReconcileResult]) -> FastAPI`:
+  - `GET /health` → `HealthResponse(status="ok", last_jobs_poll_at=state.last_jobs_poll_at,
+    last_reconcile_at=state.last_reconcile_at)`.
+  - `GET /status` → `repository.status_counts()` + `repository.recent_entries(20)`, сериализованные
+    в `StatusResponse`.
+  - `POST /reconcile` → зовёт инжектированный `run_reconcile()` (это не `Reconciler.run_once()`
+    напрямую — обёртка из `main.py`, которая **и** обновляет `state.last_reconcile_at`, **и** берёт
+    тот же `threading.Lock()`, что и плановый поток сверки, чтобы не тестировать/дублировать эту
+    логику внутри `api.py`) → `ReconcileResponse`.
+  - Никакой бизнес-логики в самом `api.py` — только формирование ответа и делегирование уже готовым
+    вызываемым объектам, инжектированным из `main.py` (композиция).
+
+### `src/main.py`
+
+- `def _now() -> datetime` — `datetime.now(UTC)`, единственный источник времени процесса.
+- `def _build_ad_gateway(settings: Settings, subjects: dict[str, SubjectConfig]) -> AdGateway` —
+  строит `AdGateway` с собственным LDAPS-соединением и `reconnect`-замыканием
+  (`build_ldaps_connection` по `settings.ldap_*`); вызывается дважды в `main()` (для jobs и для
+  reconcile — см. решение по потокобезопасности выше).
+- `def _seconds_until_next_summary(target_time: str, tz: ZoneInfo, now: datetime) -> float` —
+  чистая функция: парсит `"HH:MM"`, считает секунды до ближайшего срабатывания в таймзоне `tz`
+  относительно `now` (если время сегодня уже прошло — берёт завтра). Вынесена отдельно ради теста.
+- `def _loop(stop: threading.Event, interval_seconds: float, tick: Callable[[], object], label:
+  str) -> None` — общий идиом `while not stop.wait(interval_seconds): tick()` (раздел SOLID
+  CLAUDE.md) с `try/except Exception: logger.exception(...)` вокруг `tick()`, чтобы одна ошибка
+  тика не убила поток.
+- `def _daily_summary_loop(stop: threading.Event, settings: Settings, repository: JobRepository) ->
+  None` — отдельный от `_loop` цикл (интервал не фиксированный, а «до следующего HH:MM»):
+  `while not stop.wait(_seconds_until_next_summary(...)): logger.info("дневная сводка: ...",
+  *repository.daily_counts(_now() - timedelta(hours=24)))`, в `try/except` аналогично `_loop`.
+- `def main() -> None`:
+  1. `settings = Settings()`; `configure_logging(data_dir=settings.data_dir,
+     loki_url=settings.loki_url)`.
+  2. `subjects = load_subjects(settings.subjects_file)`.
+  3. `jobs_directory = _build_ad_gateway(...)`; `reconcile_directory = _build_ad_gateway(...)`;
+     `jobs_directory.verify_zone_exists()` (fail fast — `ManagedZoneConfigError` наружу, процесс не
+     стартует).
+  4. `lms = LmsClient(settings.lms_base_url, settings.fs_lms_ad_hmac_secret)`.
+  5. `repository = JobRepository(settings.data_dir / "state.db")`.
+  6. Реестр `handlers: dict[str, JobHandler]` — `ProvisionHandler`/`PromoteHandler`/
+     `DeprovisionHandler` на `jobs_directory` (новый тип события = новая строка реестра, без правки
+     остального кода — раздел SOLID/O CLAUDE.md).
+  7. `poller = Poller(...)`, `reconciler = Reconciler(..., reconcile_directory, ...)`.
+  8. `state = AppState()`; `reconcile_lock = threading.Lock()`; `stop = threading.Event()`.
+  9. `run_jobs_tick()`/`run_reconcile_tick()` — локальные замыкания, обновляющие `state.*_at` после
+     вызова `poller.run_once()`/`reconciler.run_once()` (второе — под `reconcile_lock`).
+  10. Запуск потоков: `jobs` (`_loop`, `settings.jobs_poll_seconds`), `reconcile` (`_loop`,
+      `settings.reconcile_interval_hours * 3600`), `daily-summary` (только если
+      `settings.daily_summary_time` задан) — все `daemon=True`.
+  11. `app = create_api(state=state, repository=repository, run_reconcile=run_reconcile_tick)`;
+      `server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=settings.api_port,
+      log_config=None))`; `uvicorn` запускается в **своём** потоке (`threading.Thread(target=
+      server.run)`) — по исходникам `uvicorn.Server.install_signal_handlers()` сам пропускает
+      установку обработчиков сигналов, если вызван не из главного потока, поэтому сигналами
+      управляет только `main()`, без конфликта с uvicorn.
+  12. `signal.signal(SIGTERM/SIGINT, ...)` в главном потоке: `logger.info(...)` → `stop.set()` →
+      `server.should_exit = True` (просит uvicorn завершиться после текущих запросов).
+  13. `stop.wait()` (блокирует главный поток до сигнала) → `join(timeout=10)` на все потоки →
+      `lms.close()`, `repository.close()`, `jobs_directory.close()`, `reconcile_directory.close()`.
+- Это и есть **graceful shutdown** из раздела Job Processing Rules CLAUDE.md: `run_once()` внутри
+  `_loop` не прерывается на середине — `stop.wait()` проверяется только между тиками, поэтому
+  текущее задание/сверка всегда дообрабатываются до конца перед выходом из цикла.
+- `if __name__ == "__main__": main()`.
+
+### Тесты
+
+`tests/test_repository.py` (доп.):
+- `status_counts`: журнал с несколькими `done`/`failed` по разным `idempotency_key`, один ключ с
+  6 `failed` подряд → `dead == 1`, остальные ключи с < 6 `failed` в `dead` не попадают.
+- `recent_entries`: `limit` меньше числа записей в журнале → возвращаются именно последние `limit`
+  (по `id DESC`), с корректно распарсенными `datetime`.
+
+`tests/test_api.py` (`fastapi.testclient.TestClient`, без реального `main.py`/сети):
+- `GET /health` возвращает `status="ok"` и значения из подставленного `AppState` (включая `None`,
+  если тика ещё не было).
+- `GET /status` возвращает счётчики из фейкового/тестового `JobRepository` (реальный на `tmp_path`,
+  как в `test_repository.py`) и не более `20` последних записей.
+- `POST /reconcile` зовёт инжектированный `run_reconcile` ровно один раз и возвращает его результат
+  в ожидаемой форме (`aborted`, `abort_reason`, `disabled_usernames`).
+
+`tests/test_main.py`:
+- `_seconds_until_next_summary`: время ещё не наступило сегодня → секунды до сегодняшнего HH:MM;
+  время уже прошло сегодня → секунды до завтрашнего HH:MM (проверить на границе — `now` ровно равен
+  целевому времени, тоже уходит на завтра, чтобы не спамить сводку дважды в одну и ту же минуту).
+
+### Проверка перед завершением этапа
+
+```
+uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
+```
+
+Зависимости новые не нужны — `fastapi`/`uvicorn` уже в проекте (этап 0).
+
+---
+
+## Пост-этап 9 — удаление события `promote`
+
+При подготовке `.docs/basic_doc.md`/`.docs/AdSync_API.md` и сверке с нормативными документами
+модуля `Inc\Modules\AdSync` (`.docs/FS_LMS_API.md` §3.1 и — что важнее — оригинал
+`AdSyncPythonService.md` в самом репозитории плагина `fs-lms`) подтвердилось: событие `promote`
+**не существует** в контракте WP и никогда не отдаётся. На этапах 1/5/6 выше `PromoteJob`/
+`PromoteHandler` были реализованы как задел на случай появления такого события в будущем — этот
+задел убран целиком:
+
+- `src/models.py` — `PromoteJob` удалён из discriminated union `Job` (остались `ProvisionJob |
+  DeprovisionJob`).
+- `src/handlers.py` — класс `PromoteHandler` удалён.
+- `src/main.py` — строка `"promote": PromoteHandler(...)` убрана из реестра обработчиков.
+- Тесты: `TestPromoteHandler` (`test_handlers.py`), `test_promote_job_parses_from_raw_payload`
+  (`test_models.py`), promote-ветка в `test_get_jobs_signs_empty_body_and_parses_mixed_jobs`
+  (`test_lms.py`) — удалены; в `test_poller.py` четыре теста, использовавшие `PromoteJob`/
+  `PromoteHandler` как удобную заглушку для сценариев (изоляция ошибок, dead-порог, отсутствие
+  обработчика), переписаны на `DeprovisionJob`/`DeprovisionHandler` без потери покрытия сценария.
+- Заодно расширен `JOBS_LIMIT`: `Field(default=50, ge=1, le=100)` → `le=200` — контракт fs-lms сам
+  допускает `limit` до 200 (`.docs/FS_LMS_API.md` §3.1), прежнее `le=100` было ничем не
+  обосновано у́же.
+
+Все упоминания `promote` в разбивках этапов 1/5/6 выше — исторический след (что было реально
+спланировано и построено в момент написания), не трогаются задним числом. Актуальное состояние —
+`.docs/CLAUDE.md` (раздел «События → действия в AD») и `.docs/AdSync_API.md`.
+
+---

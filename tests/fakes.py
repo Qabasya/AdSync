@@ -1,7 +1,11 @@
 """In-memory фейки Protocol-интерфейсов для тестов (без сети, без реального AD)."""
 
-from ad import DirectoryUser, OutsideManagedZoneError
+from datetime import UTC, datetime
+
+from ad import DirectoryUser, OutsideManagedZoneError, ZoneAccount
 from models import AckRequest, Job
+
+_DEFAULT_CREATED_AT = datetime(2000, 1, 1, tzinfo=UTC)
 
 
 class FakeLmsApi:
@@ -11,15 +15,24 @@ class FakeLmsApi:
         self,
         jobs: list[Job] | None = None,
         active_usernames: list[str] | None = None,
+        *,
+        get_jobs_error: Exception | None = None,
+        ack_error: Exception | None = None,
     ) -> None:
         self.jobs: list[Job] = jobs if jobs is not None else []
         self.active_usernames: list[str] = active_usernames if active_usernames is not None else []
         self.acks: list[AckRequest] = []
+        self._get_jobs_error = get_jobs_error
+        self._ack_error = ack_error
 
     def get_jobs(self, limit: int) -> list[Job]:
+        if self._get_jobs_error is not None:
+            raise self._get_jobs_error
         return self.jobs[:limit]
 
     def ack(self, request: AckRequest) -> None:
+        if self._ack_error is not None:
+            raise self._ack_error
         self.acks.append(request)
 
     def get_active_usernames(self) -> list[str]:
@@ -42,6 +55,7 @@ class FakeDirectoryGateway:
         self.users_by_username: dict[str, DirectoryUser] = {}
         self.group_members: dict[str, set[str]] = {}
         self.passwords: dict[str, str] = {}
+        self.created_at: dict[str, datetime] = {}
 
     def is_in_managed_zone(self, dn: str) -> bool:
         return any(dn.endswith(zone_dn) for zone_dn in self._zone_dns if zone_dn)
@@ -52,9 +66,18 @@ class FakeDirectoryGateway:
     def find_user(self, username: str) -> DirectoryUser | None:
         return self.users_by_username.get(username)
 
-    def create_user(self, *, ou_dn: str, username: str, first: str, last: str) -> str:
+    def create_user(
+        self,
+        *,
+        ou_dn: str,
+        username: str,
+        first: str,
+        last: str,
+        created_at: datetime | None = None,
+    ) -> str:
         dn = f"CN={first} {last},{ou_dn}"
         self.users_by_username[username] = DirectoryUser(dn=dn, enabled=True)
+        self.created_at[username] = created_at or _DEFAULT_CREATED_AT
         return dn
 
     def ensure_password(self, dn: str, password: str) -> None:
@@ -93,3 +116,15 @@ class FakeDirectoryGateway:
 
     def verify_zone_exists(self) -> None:
         return None
+
+    def list_zone_accounts(self) -> list[ZoneAccount]:
+        return [
+            ZoneAccount(
+                dn=user.dn,
+                username=username,
+                enabled=user.enabled,
+                created_at=self.created_at[username],
+            )
+            for username, user in self.users_by_username.items()
+            if self.is_in_managed_zone(user.dn) and not self.is_in_disabled_ou(user.dn)
+        ]

@@ -64,7 +64,7 @@ class Settings(BaseSettings):
     fs_lms_ad_hmac_secret: str
 
     jobs_poll_seconds: int = 3
-    jobs_limit: int = Field(default=50, ge=1, le=100)
+    jobs_limit: int = Field(default=50, ge=1, le=200)
 
     reconcile_interval_hours: int = 6
     reconcile_grace_minutes: int = 15
@@ -88,7 +88,5 @@ class Settings(BaseSettings):
     daily_summary_time: str | None = None
 
     loki_url: str | None = None
-    telegram_bot_token: str | None = None
-    telegram_chat_id: str | None = None
 
     api_port: int = 8091

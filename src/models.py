@@ -21,15 +21,6 @@ class ProvisionJob(BaseModel):
     subject_key: str
 
 
-class PromoteJob(BaseModel):
-    """Задание на идемпотентную проверку «всё на месте» для зачисленного ученика."""
-
-    id: int
-    event: Literal["promote"]
-    idempotency_key: str
-    username: str
-
-
 class DeprovisionJob(BaseModel):
     """Задание на отключение учётной записи и перенос в OU «Отчисленные»."""
 
@@ -39,7 +30,7 @@ class DeprovisionJob(BaseModel):
     username: str
 
 
-Job = Annotated[ProvisionJob | PromoteJob | DeprovisionJob, Field(discriminator="event")]
+Job = Annotated[ProvisionJob | DeprovisionJob, Field(discriminator="event")]
 
 
 class JobsResponse(BaseModel):

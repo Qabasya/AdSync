@@ -11,7 +11,7 @@ from typing import Literal, Protocol
 
 from ad import DirectoryGateway
 from config import SubjectConfig
-from models import DeprovisionJob, Job, PromoteJob, ProvisionJob
+from models import DeprovisionJob, Job, ProvisionJob
 
 logger = logging.getLogger("adsync.handlers")
 
@@ -69,6 +69,7 @@ class ProvisionHandler:
             self._directory.ensure_password(dn, job.password)
             if target_group is not None:
                 self._directory.ensure_group_membership(dn, target_group)
+            logger.info("создана учётка %s в %s", job.username, target_ou)
             return HandlerResult("done")
 
         if self._directory.is_in_disabled_ou(existing.dn):
@@ -77,33 +78,18 @@ class ProvisionHandler:
             self._directory.ensure_password(new_dn, job.password)
             if target_group is not None:
                 self._directory.ensure_group_membership(new_dn, target_group)
+            logger.info("реактивирована учётка %s: %s → %s", job.username, existing.dn, target_ou)
             return HandlerResult("done")
 
         if self._directory.is_in_managed_zone(existing.dn):
             self._directory.ensure_password(existing.dn, job.password)
             if target_group is not None:
                 self._directory.ensure_group_membership(existing.dn, target_group)
+            logger.info("обновлена учётка %s в зоне", job.username)
             return HandlerResult("done")
 
         logger.error("Учётная запись %s вне управляемой зоны, объект не тронут", job.username)
         return HandlerResult("failed", error="учётная запись вне управляемой зоны")
-
-
-class PromoteHandler:
-    """Обработчик `promote`: идемпотентная проверка «всё на месте»."""
-
-    def __init__(self, directory: DirectoryGateway) -> None:
-        self._directory = directory
-
-    def handle(self, job: Job) -> HandlerResult:
-        assert isinstance(job, PromoteJob)
-
-        user = self._directory.find_user(job.username)
-        if user is None:
-            return HandlerResult("failed", error="учётная запись не найдена")
-        if user.enabled and self._directory.is_in_managed_zone(user.dn):
-            return HandlerResult("done")
-        return HandlerResult("failed", error="учётная запись отключена или вне управляемой зоны")
 
 
 class DeprovisionHandler:
@@ -118,6 +104,7 @@ class DeprovisionHandler:
 
         user = self._directory.find_user(job.username)
         if user is None:
+            logger.info("deprovision %s: учётки уже нет, цель достигнута", job.username)
             return HandlerResult("done")
 
         if not self._directory.is_in_managed_zone(user.dn):
@@ -125,8 +112,10 @@ class DeprovisionHandler:
             return HandlerResult("failed", error="учётная запись вне управляемой зоны")
 
         if not user.enabled:
+            logger.info("deprovision %s: уже отключена", job.username)
             return HandlerResult("done")
 
         self._directory.ensure_disabled(user.dn)
         self._directory.move_to_ou(user.dn, self._ou_disabled)
+        logger.info("deprovision %s: отключена и перенесена в %s", job.username, self._ou_disabled)
         return HandlerResult("done")
