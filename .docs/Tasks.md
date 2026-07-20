@@ -121,3 +121,71 @@ uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
 ```
 
 Зависимости новые не нужны — `pydantic`, `pydantic-settings`, `PyYAML` уже добавлены на этапе 0.
+
+---
+
+## Этап 2 — Журнал (SQLite)
+
+### Файлы
+
+| Файл | Статус | Роль |
+|---|---|---|
+| `src/repository.py` | новый | Append-only журнал обработок в SQLite (WAL), dead-счётчик |
+| `tests/test_repository.py` | новый | покрытие репозитория |
+
+### `src/repository.py`
+
+Единственная точка доступа к `DATA_DIR/state.db`; без ORM, `sqlite3` (stdlib) напрямую. Не знает
+про ack/HTTP/бизнес-правила — только хранит факты и умеет их агрегировать.
+
+- `@dataclass(frozen=True, slots=True) class JobLogEntry` — внутренний value-object одной строки
+  журнала: `job_id: int`, `idempotency_key: str`, `event: str`, `username: str`,
+  `subject_key: str | None`, `status: Literal["done", "failed"]`, `error: str | None`,
+  `received_at: datetime`, `acked_at: datetime`. Вызывающий код (poller, этап 6) передаёт уже
+  готовые UTC-datetime — репозиторий не работает со временем сам по себе (никакого `now`
+  внутри), только форматирует в ISO 8601 при записи.
+- `class JobRepository`:
+  - `__init__(self, db_path: Path) -> None` — создаёт `db_path.parent`, если его нет; открывает
+    `sqlite3.connect(db_path, check_same_thread=False)` (доступ из разных потоков: poller,
+    reconcile, локальное API); включает `PRAGMA journal_mode=WAL`; создаёт таблицу `jobs` и индекс
+    по `idempotency_key`, если их ещё нет. Внутренний `threading.Lock` сериализует запись/чтение
+    (sqlite3-соединение не потокобезопасно для конкурентного использования).
+  - `def record(self, entry: JobLogEntry) -> None` — **append-only** `INSERT` строки журнала.
+    Никогда не апдейтит и не удаляет существующие строки — повторная выдача одного и того же
+    `idempotency_key` пишет новую строку, а не перезаписывает старую (это и есть источник
+    dead-счётчика).
+  - `def dead_count(self, idempotency_key: str) -> int` — `SELECT COUNT(*) FROM jobs WHERE
+    idempotency_key = ? AND status = 'failed'`.
+  - `def close(self) -> None` — закрывает соединение (для graceful shutdown в `main.py`, этап 9).
+
+Схема таблицы `jobs` — ровно по разделу State (SQLite) CLAUDE.md: `id INTEGER PRIMARY KEY
+AUTOINCREMENT`, `job_id`, `idempotency_key`, `event`, `username`, `subject_key` (nullable),
+`status` (`CHECK IN ('done','failed')`), `error` (nullable), `received_at`, `acked_at` (оба —
+`TEXT`, UTC ISO 8601). **Пароль и сырой payload в схеме отсутствуют в принципе** — ни колонки,
+ни возможности их туда положить.
+
+Не добавляется на этом этапе (будет добавлено, когда реально понадобится соответствующему
+потребителю): выборка последних N записей для `/status` (этап 9), агрегаты для дневной сводки
+(этап 8) — тонкие read-методы допишем в те этапы, а не заранее.
+
+### Тесты (`tests/test_repository.py`, всё на `tmp_path`)
+
+- запись через `record()` появляется в БД с ожидаемыми полями (читаем сырым `sqlite3.connect` —
+  без обхода через репозиторий, чтобы не тестировать «через себя»);
+- в схеме таблицы нет колонки под пароль/сырой payload (`PRAGMA table_info(jobs)` не содержит
+  `password`/`payload`);
+- **append-only**: два вызова `record()` с одинаковым `idempotency_key` дают две строки, а не одну
+  перезаписанную;
+- `dead_count()` считает только `status='failed'` по конкретному `idempotency_key`, не задевая
+  `done`-записи и записи с другим ключом;
+- журнал открыт в режиме WAL (`PRAGMA journal_mode` → `wal`);
+- `db_path` с несуществующей родительской директорией — `JobRepository` создаёт её сама;
+- `close()` не бросает исключений и корректно освобождает соединение.
+
+### Проверка перед завершением этапа
+
+```
+uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
+```
+
+Зависимости новые не нужны — `sqlite3`/`threading`/`dataclasses` — stdlib.
