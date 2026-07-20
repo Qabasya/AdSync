@@ -264,3 +264,131 @@ uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
 
 Зависимости новые не нужны — `httpx` уже добавлен на этапе 0; `httpx.MockTransport` — часть самого
 `httpx`, отдельного тестового HTTP-мока (`respx`, `pytest-httpx` и т.п.) не добавляем.
+
+---
+
+## Этап 4 — AD-шлюз
+
+Разведка перед проектированием (сделана): `ldap3` (2.9.1) поддерживает тестовую стратегию
+`MOCK_SYNC` — полноценная in-memory директория без сети и без сторонних зависимостей:
+`Connection(server, ..., client_strategy=MOCK_SYNC)`, `connection.strategy.add_entry(dn, attrs)`
+для затравки, дальше обычные `search`/`add`/`modify`/`modify_dn`/
+`extend.microsoft.modify_password` работают как на настоящем сервере и бросают те же исключения
+(`LDAPEntryAlreadyExistsResult`, `LDAPNoSuchObjectResult` и т.д. при `raise_exceptions=True`).
+Этим и пользуемся в `tests/test_ad.py` — реальный `AdGateway`, без сети.
+
+Важно: `ad.py` реализует только **примитивы** (по одному LDAP-действию на метод) + zone-guard +
+переподключение. Ветвление по бизнес-правилам таблицы «События → действия в AD» и «Правила поверх
+таблицы» (что делать, если учётка уже существует / в «Отчисленных» / вне зоны и т.д.) — это
+`handlers.py`, этап 5. `ad.py` про них не знает.
+
+### Файлы
+
+| Файл | Статус | Роль |
+|---|---|---|
+| `src/ad.py` | новый | `DirectoryGateway` (Protocol) + `AdGateway` (ldap3): примитивы, zone-guard, реконнект |
+| `tests/fakes.py` | правка | добавить `FakeDirectoryGateway` |
+| `tests/test_ad.py` | новый | покрытие `AdGateway` на `MOCK_SYNC` |
+
+### `src/ad.py`
+
+- `@dataclass(frozen=True, slots=True) class DirectoryUser` — `dn: str`, `enabled: bool`; то, что
+  возвращает поиск учётки.
+- `class OutsideManagedZoneError(Exception)` — попытка операции над DN вне управляемой зоны;
+  объект не трогается.
+- `class ManagedZoneConfigError(Exception)` — на старте не найден в AD один из DN конфигурации
+  (`ou_dn`/`group_dn` из `subjects.yaml`, `AD_OU_DISABLED`, `AD_OU_FALLBACK`).
+- `class DirectoryGateway(Protocol)`:
+  - `find_user(self, username: str) -> DirectoryUser | None` — поиск по `sAMAccountName` от
+    корня домена (не только в зоне — иначе не отличить «чужую» учётку от отсутствующей).
+  - `is_in_managed_zone(self, dn: str) -> bool` / `is_in_disabled_ou(self, dn: str) -> bool`.
+  - `create_user(self, *, ou_dn: str, username: str, first: str, last: str) -> str` — DN.
+  - `ensure_password(self, dn: str, password: str) -> None`.
+  - `ensure_enabled(self, dn: str) -> None` / `ensure_disabled(self, dn: str) -> None`.
+  - `ensure_group_membership(self, user_dn: str, group_dn: str) -> None`.
+  - `move_to_ou(self, dn: str, target_ou_dn: str) -> str` — новый DN.
+  - `verify_zone_exists(self) -> None` — стартовая проверка всех DN конфигурации.
+- `class AdGateway`:
+  - `__init__(self, connection: ldap3.Connection, *, reconnect: Callable[[], ldap3.Connection],
+    subjects: dict[str, SubjectConfig], ou_disabled: str, ou_fallback: str, upn_suffix: str) ->
+    None` — конструктор принимает уже готовое (собранное вызывающим кодом) `Connection`;
+    `reconnect` — тот же идиом, что `now: Callable[[]]` в проекте: зависимость «дай мне свежее
+    соединение», а не «как его строить». `subjects`/`ou_disabled`/`ou_fallback` формируют список DN
+    управляемой зоны; `upn_suffix` — для `userPrincipalName` и вычисления корня поиска домена
+    (`DC=fs,DC=loc` из `fs.loc`).
+  - `_run(self, operation: Callable[[], T]) -> T` — вызывает `operation()`; при
+    `LDAPCommunicationError` (родитель `LDAPSocketOpenError`/`LDAPSessionTerminatedByServerError`/
+    `LDAPSocketReceiveError` и т.п.) логирует WARNING, вызывает `self._connection =
+    self._reconnect()` и повторяет **один раз**. `operation` всегда замыкание над `self`
+    (`lambda: self._connection.search(...)`), поэтому повтор идёт уже на новом соединении.
+  - `find_user` — `search` от `DC=...` (из `upn_suffix`) по `(sAMAccountName=...)` (значение через
+    `ldap3.utils.conv.escape_filter_chars`); `None`, если пусто; иначе `DirectoryUser(dn=entry_dn,
+    enabled=not (int(userAccountControl) & 0x2))`.
+  - `create_user` — строит `dn = f"CN={escape_rdn(first+' '+last)},{ou_dn}"`,
+    `add(dn, ["top","person","organizationalPerson","user"], {...,
+    "userAccountControl": 512})`; ловит `LDAPEntryAlreadyExistsResult` — идемпотентно, не ошибка.
+    Пароль внутри `create_user` **не** ставится — это отдельный шаг (`ensure_password`), как и в
+    таблице CLAUDE.md.
+  - `ensure_password` — guard зоны, затем `connection.extend.microsoft.modify_password(dn,
+    password)` (ровно то, что требует CLAUDE.md; никакого ручного `modify` по `unicodePwd`).
+  - `ensure_enabled`/`ensure_disabled` — guard зоны, `modify(dn, {"userAccountControl":
+    [(MODIFY_REPLACE, [512 или 514])]})`.
+  - `ensure_group_membership` — guard зоны; сначала `search(group_dn, BASE, attributes=["member"])`
+    и проверка, есть ли уже `user_dn` среди значений (`_dn_equals`, регистронезависимое посегментное
+    сравнение через `ldap3.utils.dn.parse_dn`); если да — no-op; иначе `MODIFY_ADD`. Идемпотентность
+    через предварительную проверку, а не через отлов ошибки «уже есть» (в MOCK_SYNC она не
+    воспроизводится, а на реальном AD поведение по этой же причине надёжнее не полагаться на код
+    ошибки).
+  - `move_to_ou` — guard зоны; если текущий родитель DN (через `parse_dn`) уже равен целевой OU —
+    no-op, вернуть тот же DN; иначе `modify_dn(dn, new_rdn, new_superior=target_ou_dn)`.
+  - `verify_zone_exists` — по каждому DN из `{ou_dn, group_dn}` всех направлений + `ou_disabled` +
+    `ou_fallback` делает `search(dn, BASE, "(objectClass=*)")`; ловит `LDAPNoSuchObjectResult` →
+    считает отсутствующим; в конце, если есть отсутствующие — одно
+    `ManagedZoneConfigError` со списком всех недостающих DN сразу (не только первого).
+  - `close(self) -> None` — `connection.unbind()`.
+  - Внутренние хелперы: `_dn_components`/`_is_within_ou`/`_dn_equals`/`_parent_ou` — сравнение DN
+    по сегментам через `ldap3.utils.dn.parse_dn` (регистронезависимо), а не наивным `str.endswith`.
+- `def build_ldaps_connection(*, host: str, port: int, ca_cert_path: Path, bind_dn: str,
+  bind_password: str) -> ldap3.Connection` — модульная функция (не метод): `Tls(validate=
+  ssl.CERT_REQUIRED, ca_certs_file=str(ca_cert_path))` → `Server(host, port=port, use_ssl=True,
+  tls=tls)` → `Connection(server, user=bind_dn, password=bind_password, auto_bind=True,
+  raise_exceptions=True)`. Используется `main.py` (этап 9) для сборки боевого соединения и как
+  `reconnect`-замыкание. **Не покрывается pytest** (нужен реальный DC с LDAPS) — проверяется
+  `scripts/smoke.py` (этап 10), как и оговорено в разделе Testing CLAUDE.md.
+
+### `tests/fakes.py` — добавить `FakeDirectoryGateway`
+
+In-memory реализация `DirectoryGateway` для будущих тестов `handlers.py`/`poller.py`/
+`reconcile.py`: словари `username -> DirectoryUser`, `group_dn -> set[user_dn]`; `create_user`/
+`ensure_password`/`ensure_enabled`/`ensure_disabled`/`ensure_group_membership`/`move_to_ou` мутируют
+эти словари; `is_in_managed_zone`/`is_in_disabled_ou` — сравнение по сконфигурированным на
+конструкторе множествам OU; `verify_zone_exists` — no-op. Без сети, без ldap3.
+
+### Тесты (`tests/test_ad.py`, на реальном `AdGateway` + `ldap3` `MOCK_SYNC`, сеть не участвует)
+
+- `find_user`: `None`, если не найдена; `DirectoryUser(dn, enabled)` — корректный `enabled` для
+  `userAccountControl=512` и `=514`.
+- `create_user` идемпотентен: два вызова с той же учёткой — не бросает, оба раза один и тот же DN.
+- `ensure_password` не бросает на существующей в зоне учётке (сам факт вызова
+  `extend.microsoft.modify_password` через `MOCK_SYNC` проходит).
+- `ensure_enabled`/`ensure_disabled` меняют видимое через `find_user` состояние `enabled`.
+- `ensure_group_membership`: после вызова пользователь — член группы; повторный вызов не создаёт
+  дубликат в `member`.
+- `move_to_ou`: DN учётки меняется на ожидаемый; повторный вызов в ту же OU — не бросает, возвращает
+  тот же DN.
+- **Zone guard**: `ensure_password`/`ensure_enabled`/`ensure_group_membership`/`move_to_ou` на DN
+  вне сконфигурированной зоны → `OutsideManagedZoneError`, объект в директории не изменяется.
+- `is_in_managed_zone`/`is_in_disabled_ou`: корректная классификация DN из зоны/«Отчисленных»/чужого.
+- `verify_zone_exists`: проходит, если все DN конфигурации существуют в директории; бросает
+  `ManagedZoneConfigError` со **списком всех** недостающих DN, если каких-то нет.
+- **Реконнект**: тестовая обёртка над `Connection`, у которой первый вызов выбранного метода бросает
+  `LDAPSocketOpenError`, второй — работает; `reconnect=` возвращает новое рабочее соединение;
+  проверяем, что операция в итоге отработала (используя новое соединение), а не упала и не зациклилась.
+
+### Проверка перед завершением этапа
+
+```
+uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
+```
+
+Зависимости новые не нужны — `ldap3` добавлен на этапе 0; `MOCK_SYNC` — часть самого `ldap3`.
