@@ -11,15 +11,24 @@ class FakeLmsApi:
         self,
         jobs: list[Job] | None = None,
         active_usernames: list[str] | None = None,
+        *,
+        get_jobs_error: Exception | None = None,
+        ack_error: Exception | None = None,
     ) -> None:
         self.jobs: list[Job] = jobs if jobs is not None else []
         self.active_usernames: list[str] = active_usernames if active_usernames is not None else []
         self.acks: list[AckRequest] = []
+        self._get_jobs_error = get_jobs_error
+        self._ack_error = ack_error
 
     def get_jobs(self, limit: int) -> list[Job]:
+        if self._get_jobs_error is not None:
+            raise self._get_jobs_error
         return self.jobs[:limit]
 
     def ack(self, request: AckRequest) -> None:
+        if self._ack_error is not None:
+            raise self._ack_error
         self.acks.append(request)
 
     def get_active_usernames(self) -> list[str]:

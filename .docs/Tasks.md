@@ -501,3 +501,100 @@ uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
 ```
 
 Зависимости новые не нужны.
+
+---
+
+## Этап 6 — Поллер заданий
+
+`poller.py` — цикл заданий: `fetch → dispatch → ack → журнал`, последовательно, один поток
+(раздел Job Processing Rules CLAUDE.md). Про AD/LDAP не знает — только `LmsApi`, реестр
+`JobHandler` и `JobRepository`. Про потоки/`while not stop.wait(...)`/SIGTERM не знает — это
+`main.py` (этап 9); `poller.py` даёт один метод «прогнать один тик».
+
+### Файлы
+
+| Файл | Статус | Роль |
+|---|---|---|
+| `src/poller.py` | новый | `Poller`: один тик обработки заданий |
+| `tests/fakes.py` | правка | `FakeLmsApi` — опциональная имитация сетевых ошибок `get_jobs`/`ack` |
+| `tests/test_poller.py` | новый | покрытие `Poller` на `FakeLmsApi` + реальных обработчиках/`FakeDirectoryGateway` + `JobRepository` на `tmp_path` |
+
+### `src/poller.py`
+
+- `class Poller`:
+  - `__init__(self, lms: LmsApi, *, handlers: dict[str, JobHandler], repository: JobRepository,
+    jobs_limit: int, now: Callable[[], datetime]) -> None` — `now` внедряется зависимостью (как
+    того требует раздел Code Style CLAUDE.md), `repository.record()` сам с датой/временем не
+    работает (см. `repository.py`, этап 2).
+  - `def run_once(self) -> None`:
+    1. `received_at = self._now()`; `jobs = self._lms.get_jobs(self._jobs_limit)` — любое
+       исключение (сеть, `httpx.HTTPStatusError`, `pydantic.ValidationError` при невалидном
+       задании в списке — весь список валидируется атомарно, см. ниже «Известное отклонение») →
+       `logger.error(...)`, тик завершается, ack никому не шлётся, цикл не падает.
+    2. Для каждого `job` из `jobs` — `self._process(job, received_at)`; ошибка одного задания не
+       прерывает обработку остальных.
+  - `def _process(self, job: Job, received_at: datetime) -> None`:
+    1. `handler = self._handlers.get(job.event)`; если обработчика нет (бага реестра в
+       `main.py`) — `HandlerResult("failed", error=f"нет обработчика для {job.event!r}")` без
+       попытки вызова.
+    2. Иначе — вызов `handler.handle(job)` в `try/except Exception`; исключение (LDAP-ошибка,
+       `OutsideManagedZoneError` и т.п.) → `logger.exception(...)` (без вывода самого `job` целиком
+       — только `job.id`/`job.event`/`job.username`, пароль в лог никогда не должен попасть) →
+       `HandlerResult("failed", error=str(exc))`.
+    3. `acked_at = self._now()`; `self._lms.ack(AckRequest(id=job.id, status=result.status,
+       error=result.error))` в `try/except Exception` — сбой самого ack (сеть) →
+       `logger.error(...)`, **запись в журнал не делается** (WP ack не получил — само задание
+       естественным образом переотдастся на следующий опрос, штатный pull-ретрай), выходим без
+       падения.
+    4. Ack прошёл → `subject_key = job.subject_key if isinstance(job, ProvisionJob) else None` →
+       `repository.record(JobLogEntry(job_id=job.id, idempotency_key=job.idempotency_key,
+       event=job.event, username=job.username, subject_key=subject_key, status=result.status,
+       error=result.error, received_at=received_at, acked_at=acked_at))`.
+    5. Если `result.status == "failed"` — `dead = repository.dead_count(job.idempotency_key)`;
+       `dead >= 6` (порог из раздела Dead CLAUDE.md) → `logger.error(...)` («задание мертво»).
+       Настоящий `Notifier.job_dead(...)` подключится, когда появится `notifier.py` — пока это
+       единственный сигнал, аналогично `unknown_subject` в `handlers.py` (этап 5).
+  - Логгер модуля: `logging.getLogger("adsync.poller")`.
+
+**Известное отклонение**: правило «невалидное задание → `failed` + ERROR, без попытки обработки»
+трактуется на уровне **всего тика**, а не отдельного задания — `JobsResponse.model_validate(...)`
+в `lms.py` (этап 3) валидирует список атомарно, отдельное невалидное задание нельзя выделить и
+поднять ack по нему без переработки `models.py`/`lms.py` (не входит в этот этап). На практике:
+один битый элемент в ответе роняет `get_jobs()` целиком → весь тик логируется как ERROR и штатно
+повторяется на следующем цикле, сервис не падает — соответствует духу правила («не пытаться
+обработать»), но не даёт ack по конкретному сломанному заданию.
+
+### `tests/fakes.py` — правка `FakeLmsApi`
+
+- Добавить опциональные поля конструктора `get_jobs_error: Exception | None = None`,
+  `ack_error: Exception | None = None`; если заданы — соответствующий метод бросает это исключение
+  вместо обычной работы. Нужно только сейчас (тесты сетевых сбоев поллера) — до этого фейку это не
+  требовалось (см. память проекта об инкрементальном усложнении фейков по мере надобности).
+
+### Тесты (`tests/test_poller.py`)
+
+- Смешанный тик (`provision`/`promote`/`deprovision`) — по каждому уходит `ack` с ожидаемым
+  статусом; в журнале (читаем сырым `sqlite3.connect`, как в `test_repository.py`) — по строке на
+  задание, `subject_key` заполнен только у `provision`, `NULL` у `promote`/`deprovision`.
+  `received_at`/`acked_at` — валидные ISO-таймстемпы из подставленного `now`.
+- Обработчик бросает исключение на одном из заданий пачки → `ack(failed, error=...)` по нему,
+  журнал получает `status='failed'` с текстом ошибки, **следующее задание пачки всё равно
+  обработано** (изоляция ошибок).
+- `get_jobs` бросает исключение (`FakeLmsApi(get_jobs_error=...)`) → `run_once()` не падает, `ack`
+  не вызывается ни разу, журнал пуст, ошибка залогирована (`caplog`, ERROR).
+- `ack` бросает исключение на конкретном задании (`FakeLmsApi(ack_error=...)`) →
+  `run_once()` не падает, в журнале для этого задания записи нет (ack не подтверждён), ERROR
+  залогирован.
+- Dead-порог: журнал предзаполнен 5 записями `status='failed'` с одним `idempotency_key`; тик,
+  где обработчик для задания с этим же `idempotency_key` снова падает (6-я неудача) →
+  `logger.error` про «мёртвое» задание (`caplog`), обработка при этом не падает.
+- Нет обработчика для `job.event` в реестре (пустой `handlers={}`) → `ack(failed, ...)` с понятной
+  причиной, журнал получает `status='failed'`, без падения.
+
+### Проверка перед завершением этапа
+
+```
+uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
+```
+
+Зависимости новые не нужны.
