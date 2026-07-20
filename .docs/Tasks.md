@@ -392,3 +392,112 @@ uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
 ```
 
 Зависимости новые не нужны — `ldap3` добавлен на этапе 0; `MOCK_SYNC` — часть самого `ldap3`.
+
+---
+
+## Этап 5 — Обработчики заданий
+
+`handlers.py` реализует бизнес-ветвление таблицы «События → действия в AD» и «Правила поверх
+таблицы» из `.docs/CLAUDE.md`, опираясь только на примитивы `DirectoryGateway` (`ad.py`, этап 4).
+Про HTTP/ack/журнал не знает — это `poller.py` (этап 6): он же ловит любые исключения из
+`handle()` (LDAP-ошибки, `OutsideManagedZoneError` и т.п.) и превращает их в `ack(failed)`.
+Обработчики сами намеренно **предотвращают** `OutsideManagedZoneError`, заранее проверяя зону —
+исключение из `AdGateway` тут означает баг в самом обработчике, а не штатный путь.
+
+### Файлы
+
+| Файл | Статус | Роль |
+|---|---|---|
+| `src/handlers.py` | новый | `JobHandler` (Protocol) + `HandlerResult` + `ProvisionHandler` / `PromoteHandler` / `DeprovisionHandler` |
+| `tests/test_handlers.py` | новый | покрытие всех трёх обработчиков по правилам CLAUDE.md |
+
+`tests/fakes.py` не меняется — `FakeDirectoryGateway` уже умеет всё нужное (создание в
+произвольной OU без zone-guard на `create_user`, идемпотентный `ensure_group_membership` через
+`set`, зона считается по DN).
+
+### `src/handlers.py`
+
+- `@dataclass(frozen=True, slots=True) class HandlerResult` — `status: Literal["done", "failed"]`,
+  `error: str | None = None`. Возвращается `handle()`; `poller.py` строит из него `AckRequest` и
+  (вместе с полями исходного `job`) `JobLogEntry` — `handlers.py` про журнал и ack не знает.
+- `class JobHandler(Protocol)`: `def handle(self, job: Job) -> HandlerResult: ...`. Диспетчеризация
+  по `job.event` — реестр `dict[str, JobHandler]` в `main.py` (этап 9); каждый конкретный
+  обработчик получает через реестр только «свой» тип задания, поэтому внутри `handle()` —
+  `assert isinstance(job, ProvisionJob)` (аналогично для двух других) для сужения типа под mypy
+  strict.
+- `class ProvisionHandler`:
+  - `__init__(self, directory: DirectoryGateway, *, subjects: dict[str, SubjectConfig],
+    ou_fallback: str) -> None`.
+  - `handle(self, job: ProvisionJob) -> HandlerResult`:
+    1. Резолвит цель: `subject = subjects.get(job.subject_key)`; если найден —
+       `target_ou, target_group = subject.ou_dn, subject.group_dn`; если нет —
+       `target_ou, target_group = ou_fallback, None` + `logger.warning(...)` c `username` и
+       `subject_key` (уведомление `Notifier.unknown_subject` — хук добавится, когда появится
+       `notifier.py`; пока фиксируем только через лог, как и требует раздел Logging CLAUDE.md
+       минимально).
+    2. `existing = directory.find_user(job.username)`.
+    3. Нет учётки → `directory.create_user(ou_dn=target_ou, username=job.username, first=job.first,
+       last=job.last)` → `ensure_password(dn, job.password)` → если `target_group` задан —
+       `ensure_group_membership(dn, target_group)` → `HandlerResult("done")`.
+    4. Есть учётка, `directory.is_in_disabled_ou(existing.dn)` → реактивация в порядке из
+       CLAUDE.md: `ensure_enabled(dn)` → `new_dn = move_to_ou(dn, target_ou)` →
+       `ensure_password(new_dn, job.password)` → `ensure_group_membership(new_dn, target_group)`
+       если задан → `HandlerResult("done")`.
+    5. Есть учётка, `directory.is_in_managed_zone(existing.dn)` (в зоне, не «Отчисленные») →
+       `ensure_password(dn, job.password)` → `ensure_group_membership(dn, target_group)` если
+       задан → `HandlerResult("done")` (без переноса OU — учётка остаётся, где была).
+    6. Есть учётка вне управляемой зоны → **не трогать объект**, `logger.error(...)` →
+       `HandlerResult("failed", error="учётная запись вне управляемой зоны")`.
+- `class PromoteHandler`:
+  - `__init__(self, directory: DirectoryGateway) -> None`.
+  - `handle(self, job: PromoteJob) -> HandlerResult`: `user = directory.find_user(job.username)`;
+    `None` → `HandlerResult("failed", error="учётная запись не найдена")`; иначе — `done`, если
+    `user.enabled and directory.is_in_managed_zone(user.dn)`, иначе `HandlerResult("failed",
+    error="учётная запись отключена или вне управляемой зоны")`.
+- `class DeprovisionHandler`:
+  - `__init__(self, directory: DirectoryGateway, *, ou_disabled: str) -> None`.
+  - `handle(self, job: DeprovisionJob) -> HandlerResult`:
+    - `user = directory.find_user(job.username)`; нет учётки → `HandlerResult("done")` (цель уже
+      достигнута).
+    - Есть учётка вне управляемой зоны → не трогать, `logger.error(...)` →
+      `HandlerResult("failed", error="учётная запись вне управляемой зоны")`.
+    - Есть учётка, `not user.enabled` → уже отключена → `HandlerResult("done")` без действий.
+    - Иначе → `directory.ensure_disabled(user.dn)` → `directory.move_to_ou(user.dn, ou_disabled)` →
+      `HandlerResult("done")`.
+- Логгер модуля: `logging.getLogger("adsync.handlers")`.
+
+### Тесты (`tests/test_handlers.py`, на `FakeDirectoryGateway`, без сети/LDAP)
+
+`ProvisionHandler`:
+- новая учётка, известный `subject_key` → создана в `subject.ou_dn`, пароль и членство в группе
+  выставлены, `HandlerResult("done")`;
+- новая учётка, неизвестный `subject_key` → создана в `ou_fallback`, без группы, `WARNING` в
+  логе (`caplog`), `done`;
+- учётка уже существует в OU направления (в зоне, не «Отчисленные») → пароль обновлён, членство в
+  группе обеспечено, OU не менялась, `done`;
+- учётка в «Отчисленных» → реактивация: включена, перенесена в `target_ou`, пароль и группа
+  выставлены, `done`;
+- учётка вне управляемой зоны → `failed` с непустым `error`, объект в фейке не изменился (dn,
+  enabled, пароль не записан);
+- повторная выдача того же задания (идемпотентность) → второй вызов тоже `done`, дублей в
+  `group_members` нет (проверка через `set`).
+
+`PromoteHandler`:
+- учётки нет → `failed`;
+- учётка есть, включена, в зоне → `done`;
+- учётка есть, но отключена → `failed`;
+- учётка есть, включена, но вне зоны → `failed`.
+
+`DeprovisionHandler`:
+- учётки нет → `done`, без побочных эффектов;
+- учётка есть, включена, в зоне → отключена и перенесена в `ou_disabled`, `done`;
+- учётка уже отключена → `done`, без изменений (позиция и флаг не трогаются повторно);
+- учётка есть, вне зоны → `failed`, объект не изменён.
+
+### Проверка перед завершением этапа
+
+```
+uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
+```
+
+Зависимости новые не нужны.
