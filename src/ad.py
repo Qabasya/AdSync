@@ -5,9 +5,12 @@
 """
 
 import logging
+import re
 import ssl
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Protocol, TypeVar
 
@@ -31,6 +34,8 @@ _USER_OBJECT_CLASSES = ["top", "person", "organizationalPerson", "user"]
 
 T = TypeVar("T")
 
+_WHEN_CREATED_RE = re.compile(r"^(\d{14})(?:\.\d+)?Z$")
+
 
 @dataclass(frozen=True, slots=True)
 class DirectoryUser:
@@ -38,6 +43,29 @@ class DirectoryUser:
 
     dn: str
     enabled: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ZoneAccount:
+    """Учётная запись из массового перечисления управляемой зоны (для сверки)."""
+
+    dn: str
+    username: str
+    enabled: bool
+    created_at: datetime
+
+
+def _parse_when_created(value: object) -> datetime:
+    """Разбирает `whenCreated` (формат `GeneralizedTime` AD) в aware `datetime` (UTC).
+
+    Не полагается на автоформатирование `ldap3` — оно недоступно в `MOCK_SYNC` и зависит от
+    online-схемы на настоящем сервере; разбор регэкспом одинаково работает в обоих случаях.
+    """
+    text = str(value)
+    match = _WHEN_CREATED_RE.match(text)
+    if not match:
+        raise ValueError(f"неожиданный формат whenCreated: {text!r}")
+    return datetime.strptime(match.group(1), "%Y%m%d%H%M%S").replace(tzinfo=UTC)
 
 
 class OutsideManagedZoneError(Exception):
@@ -112,6 +140,10 @@ class DirectoryGateway(Protocol):
         """Стартовая проверка: все DN конфигурации существуют в AD, иначе понятная ошибка."""
         ...
 
+    def list_zone_accounts(self) -> list[ZoneAccount]:
+        """Перечисляет учётки во всех OU направлений + `AD_OU_FALLBACK` (без «Отчисленных»)."""
+        ...
+
 
 class AdGateway:
     """Боевая реализация `DirectoryGateway` поверх `ldap3`."""
@@ -150,6 +182,9 @@ class AdGateway:
             {subject.ou_dn for subject in subjects.values()}
             | {subject.group_dn for subject in subjects.values()}
             | {ou_disabled, ou_fallback}
+        )
+        self._reconcile_ou_dns = sorted(
+            {subject.ou_dn for subject in subjects.values()} | {ou_fallback}
         )
         self._domain_root_dn = "DC=" + ",DC=".join(upn_suffix.split("."))
 
@@ -276,6 +311,30 @@ class AdGateway:
             raise ManagedZoneConfigError(
                 "в AD не найдены DN из конфигурации: " + ", ".join(missing)
             )
+
+    def list_zone_accounts(self) -> list[ZoneAccount]:
+        accounts: dict[str, ZoneAccount] = {}
+        for ou_dn in self._reconcile_ou_dns:
+            self._run(partial(self._search_zone_ou, ou_dn))
+            for entry in self._connection.entries:
+                uac = int(entry["userAccountControl"].value)
+                accounts[entry.entry_dn] = ZoneAccount(
+                    dn=entry.entry_dn,
+                    username=str(entry["sAMAccountName"].value),
+                    enabled=not bool(uac & _ACCOUNTDISABLE_BIT),
+                    created_at=_parse_when_created(entry["whenCreated"].value),
+                )
+        return list(accounts.values())
+
+    def _search_zone_ou(self, ou_dn: str) -> bool:
+        return bool(
+            self._connection.search(
+                ou_dn,
+                "(objectClass=user)",
+                SUBTREE,
+                attributes=["sAMAccountName", "userAccountControl", "whenCreated"],
+            )
+        )
 
     def _dn_exists(self, dn: str) -> bool:
         def op() -> bool:

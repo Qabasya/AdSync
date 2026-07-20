@@ -598,3 +598,126 @@ uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
 ```
 
 Зависимости новые не нужны.
+
+## Этап 7 — Сверка (reconcile)
+
+Раздел «Сверка (reconcile)» CLAUDE.md требует перечислить **все** активные учётки управляемой
+зоны (OU направлений + `AD_OU_FALLBACK`, без `AD_OU_DISABLED`) и сравнить с авторитетным списком
+от WP. У `DirectoryGateway` (этап 4) такого группового перечисления нет — только точечный
+`find_user(username)`. Разведка (сделано): `ldap3` `MOCK_SYNC` **не** заполняет `whenCreated`
+автоматически при `add()` (в отличие от настоящего AD) — значение `<no value>` (`None` в
+`.value`); в тестах его нужно сеять вручную через `connection.strategy.add_entry(...)` байтовой
+строкой формата `GeneralizedTime` (`b"20260701100000.0Z"`), как остальные преднаселённые объекты
+в `_make_connection`. Поэтому парсинг `whenCreated` в `ad.py` не полагается на автоформатирование
+`ldap3` (оно недоступно в `MOCK_SYNC` и зависит от online-схемы на настоящем AD), а сделан вручную
+регэкспом по строке — одинаково работает и в тестах, и в проде.
+
+### Файлы
+
+| Файл | Статус | Роль |
+|---|---|---|
+| `src/ad.py` | правка | `ZoneAccount` (dataclass) + `DirectoryGateway.list_zone_accounts()` + `AdGateway` реализация |
+| `src/reconcile.py` | новый | `Reconciler` — сверка с предохранителями |
+| `tests/fakes.py` | правка | `FakeDirectoryGateway.list_zone_accounts()` + `created_at` для `create_user()` |
+| `tests/test_ad.py` | правка | тест на `list_zone_accounts` (зона/fallback/исключение «Отчисленных», парсинг `whenCreated`) |
+| `tests/test_reconcile.py` | новый | покрытие `Reconciler`: happy path, все предохранители, grace, односторонность |
+
+### `src/ad.py` (правка)
+
+- `@dataclass(frozen=True, slots=True) class ZoneAccount` — `dn: str`, `username: str`,
+  `enabled: bool`, `created_at: datetime`. Отдельный тип от `DirectoryUser` — разное назначение
+  (точечный поиск по имени vs. массовое перечисление зоны с датой создания для grace-периода), не
+  расширяем `DirectoryUser` ради одного потребителя.
+- `DirectoryGateway.list_zone_accounts(self) -> list[ZoneAccount]` — перечисляет все учётки во
+  всех `ou_dn` направлений + `ou_fallback` (без `ou_disabled` — «вне сверки» по CLAUDE.md).
+- `AdGateway`:
+  - `self._reconcile_ou_dns` в `__init__` — `sorted({s.ou_dn for s in subjects.values()} |
+    {ou_fallback})` (дедуп: разные `subject_key` могут вести в одну OU).
+  - `list_zone_accounts()` — по каждой OU из `_reconcile_ou_dns`: `search(ou_dn,
+    "(objectClass=user)", SUBTREE, attributes=["sAMAccountName", "userAccountControl",
+    "whenCreated"])` через `self._run`; строит `ZoneAccount` по каждой записи; дедуп по `dn`
+    (`dict[str, ZoneAccount]`) на случай пересекающихся OU в конфиге.
+  - `_parse_when_created(value: object) -> datetime` — модульная функция: регэксп
+    `^(\d{14})(?:\.\d+)?Z$` по `str(value)` (формат `GeneralizedTime` AD, дробная часть
+    секунд опциональна), `strptime(..., "%Y%m%d%H%M%S")` → `.replace(tzinfo=UTC)`; неожиданный
+    формат/`None` → `ValueError` с сырым значением в сообщении (не глотается молча).
+
+### `src/reconcile.py`
+
+- `@dataclass(frozen=True, slots=True) class ReconcileResult` — `disabled_usernames:
+  tuple[str, ...]`, `aborted: bool`, `abort_reason: str | None = None`. Возврат `run_once()` —
+  для логов/тестов/будущей дневной сводки (этап 8, если понадобится).
+- `class Reconciler`:
+  - `__init__(self, lms: LmsApi, directory: DirectoryGateway, *, ou_disabled: str, max_disable:
+    int, max_disable_pct: int, grace_minutes: int, now: Callable[[], datetime]) -> None`.
+  - `def run_once(self) -> ReconcileResult`:
+    1. `zone_accounts = self._directory.list_zone_accounts()`.
+    2. `self._lms.get_active_usernames()` в `try/except Exception` → сбой сети/парсинга →
+       `logger.exception(...)`, `ReconcileResult((), aborted=True, abort_reason=...)`, никого не
+       трогаем (тот же принцип «не уверен — не действуй», что и остальные предохранители).
+    3. Предохранитель 1 (порядок — по CLAUDE.md): `active_usernames` пуст **и** `zone_accounts` не
+       пуст → abort, `logger.error(...)`.
+    4. `grace_cutoff = self._now() - timedelta(minutes=self._grace_minutes)`; `stale = [a for a in
+       zone_accounts if a.username not in active_usernames and a.created_at < grace_cutoff]` —
+       молодые учётки (`created_at >= grace_cutoff`) из `stale` исключаются целиком, не считаются
+       нигде дальше.
+    5. Предохранитель 2: `len(stale) > max_disable` → abort, `logger.error(...)`.
+    6. Предохранитель 3: `len(stale) * 100 > max_disable_pct * len(zone_accounts)` → abort,
+       `logger.error(...)`.
+    7. Иначе — по каждой `stale`-учётке: `directory.ensure_disabled(dn)` →
+       `directory.move_to_ou(dn, ou_disabled)` (тот же путь, что `DeprovisionHandler`, но без
+       журнала — у сверки нет `job_id`/`idempotency_key` от WP, это не про обработку задания).
+       Возврат `ReconcileResult(disabled_usernames=tuple(usernames), aborted=False)`.
+  - Всегда **односторонне**: ни при каком исходе `ensure_enabled`/`create_user`/перенос обратно не
+    вызываются — метода для этого у `Reconciler` просто нет.
+  - `Notifier.reconcile_aborted(...)` — хук добавится вместе с `notifier.py` (не в этом этапе);
+    пока абort фиксируется только `logger.error(...)`, аналогично `unknown_subject` (этап 5) и
+    dead-порогу (этап 6).
+  - Логгер модуля: `logging.getLogger("adsync.reconcile")`.
+- Про запись в `JobRepository` сознательно не идёт речи: сверка — не обработка задания WP, у неё
+  нет `job_id`/`idempotency_key`; если для дневной сводки (этап 8) понадобится считать
+  reconcile-отключения — добавим там, а не заранее.
+
+### `tests/fakes.py` — правка `FakeDirectoryGateway`
+
+- `create_user(..., created_at: datetime | None = None)` — сохраняет в `self.created_at: dict[str,
+  datetime]` (дефолт — заведомо старая дата, например `datetime(2000, 1, 1, tzinfo=UTC)`, чтобы по
+  умолчанию учётки не попадали под grace-защиту).
+- `list_zone_accounts(self) -> list[ZoneAccount]` — по `users_by_username`: включает запись, если
+  `is_in_managed_zone(dn)` и **не** `is_in_disabled_ou(dn)`; `created_at` берётся из
+  `self.created_at[username]`.
+
+### Тесты
+
+`tests/test_ad.py` (доп.):
+- `list_zone_accounts` возвращает учётки из OU направления и `ou_fallback`, не возвращает учётку из
+  `ou_disabled` и учётку вне зоны; `whenCreated`, засеянный как
+  `b"20200101000000.0Z"` напрямую через `connection.strategy.add_entry`, разбирается в
+  `datetime(2020, 1, 1, tzinfo=UTC)`.
+
+`tests/test_reconcile.py` (на `FakeDirectoryGateway` + `FakeLmsApi`, без сети):
+- happy path: в зоне 3 учётки, WP подтверждает 2 → третья отключена и перенесена в
+  `ou_disabled`, `ReconcileResult.disabled_usernames == ("third",)`, `aborted is False`.
+- сверка ничего не отключает, если все учётки зоны подтверждены WP.
+- предохранитель «пустой список при непустой зоне»: `active_usernames=[]`, зона не пуста → abort,
+  никто не тронут.
+- предохранитель `RECONCILE_MAX_DISABLE`: к отключению больше порога → abort, никто не тронут.
+- предохранитель `RECONCILE_MAX_DISABLE_PCT`: к отключению больше процента зоны → abort.
+- grace: учётка младше `RECONCILE_GRACE_MINUTES` (свежий `created_at` относительно
+  подставленного `now`) отсутствует в списке WP, но не отключается и не считается в предохранителях
+  как «к отключению».
+- `get_active_usernames` бросает исключение → `aborted=True`, `ERROR` в логе (`caplog`), никто не
+  тронут.
+- односторонность: после успешного прогона ни разу не вызывается `ensure_enabled`/`create_user` (у
+  `FakeDirectoryGateway` это проверяется, например, отсутствием изменений `enabled=True` там, где
+  не ожидалось).
+
+### Проверка перед завершением этапа
+
+```
+uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
+```
+
+Зависимости новые не нужны.
+
+---
