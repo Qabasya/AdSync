@@ -85,6 +85,13 @@ class Poller:
                 acked_at=acked_at,
             )
         )
+        logger.info(
+            "задание %s (%s) для %s обработано: %s",
+            job.id,
+            job.event,
+            job.username,
+            result.status,
+        )
 
         if result.status == "failed":
             dead = self._repository.dead_count(job.idempotency_key)

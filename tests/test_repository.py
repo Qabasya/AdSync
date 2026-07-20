@@ -1,7 +1,7 @@
 """Тесты SQLite-журнала (`repository.py`)."""
 
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from repository import JobLogEntry, JobRepository
@@ -14,20 +14,23 @@ def _entry(
     *,
     job_id: int = 1,
     idempotency_key: str = "app:1",
+    event: str = "provision",
     status: str = "done",
     error: str | None = None,
     subject_key: str | None = "inf-ege",
+    received_at: datetime = _RECEIVED_AT,
+    acked_at: datetime = _ACKED_AT,
 ) -> JobLogEntry:
     return JobLogEntry(
         job_id=job_id,
         idempotency_key=idempotency_key,
-        event="provision",
+        event=event,
         username="i.petrov",
         subject_key=subject_key,
         status=status,  # type: ignore[arg-type]
         error=error,
-        received_at=_RECEIVED_AT,
-        acked_at=_ACKED_AT,
+        received_at=received_at,
+        acked_at=acked_at,
     )
 
 
@@ -121,3 +124,45 @@ def test_creates_missing_parent_directory(tmp_path: Path) -> None:
 def test_close_does_not_raise(tmp_path: Path) -> None:
     repo = JobRepository(tmp_path / "state.db")
     repo.close()
+
+
+def test_daily_counts_aggregates_since_cutoff(tmp_path: Path) -> None:
+    repo = JobRepository(tmp_path / "state.db")
+    since = datetime(2026, 7, 20, 0, 0, 0, tzinfo=UTC)
+    before_cutoff = since - timedelta(hours=1)
+    after_cutoff = since + timedelta(hours=1)
+
+    repo.record(
+        _entry(event="provision", status="done", acked_at=after_cutoff, idempotency_key="p1")
+    )
+    repo.record(
+        _entry(event="provision", status="done", acked_at=after_cutoff, idempotency_key="p2")
+    )
+    repo.record(
+        _entry(event="deprovision", status="done", acked_at=after_cutoff, idempotency_key="d1")
+    )
+    repo.record(
+        _entry(event="promote", status="failed", acked_at=after_cutoff, idempotency_key="f1")
+    )
+    # до cutoff — не должно попасть в агрегат
+    repo.record(
+        _entry(event="provision", status="done", acked_at=before_cutoff, idempotency_key="old")
+    )
+
+    counts = repo.daily_counts(since)
+    repo.close()
+
+    assert counts.created == 2
+    assert counts.disabled == 1
+    assert counts.errors == 1
+
+
+def test_daily_counts_returns_zeroes_for_empty_journal(tmp_path: Path) -> None:
+    repo = JobRepository(tmp_path / "state.db")
+
+    counts = repo.daily_counts(datetime(2026, 7, 20, 0, 0, 0, tzinfo=UTC))
+    repo.close()
+
+    assert counts.created == 0
+    assert counts.disabled == 0
+    assert counts.errors == 0

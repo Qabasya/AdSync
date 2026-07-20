@@ -84,8 +84,9 @@ pydantic v2), обсудим при первом реальном расхожд
   - `ad_upn_suffix: str = "fs.loc"`, `ad_ou_disabled: str`, `ad_ou_fallback: str` — обязательные.
   - `subjects_file: Path = Path("/app/config/subjects.yaml")`, `data_dir: Path = Path("/data")`.
   - `tz_name: str = "Europe/Moscow"`, `daily_summary_time: str | None = None`.
-  - `loki_url: str | None = None`, `telegram_bot_token: str | None = None`,
-    `telegram_chat_id: str | None = None`.
+  - `loki_url: str | None = None` (`telegram_bot_token`/`telegram_chat_id` изначально были здесь
+    же — убраны на этапе 8, когда пользователь пояснил, что мессенджер-алертинг будет через
+    Grafana Alerting поверх Loki, а не прямым пушем из сервиса).
   - `api_port: int = 8091`.
   - Имена полей в `snake_case` — pydantic-settings сопоставляет их с переменными окружения в
     `UPPER_SNAKE_CASE` без доп. алиасов (регистронезависимо).
@@ -719,5 +720,165 @@ uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
 ```
 
 Зависимости новые не нужны.
+
+---
+
+## Этап 8 — Логирование и дневная сводка
+
+**Пересмотрено по ходу этапа**: изначально планировался отдельный `notifier.py` (`Notifier`
+Protocol + `TelegramNotifier` с явными методами `job_dead`/`unknown_subject`/
+`reconcile_aborted`/`daily_summary`) как второй канал уведомлений параллельно логам. Пользователь
+поправил подход: канал один — обычный `logging`. Успешные операции, предупреждения и ошибки идут
+через `logger.<level>(...)` по всему коду; Telegram — не отдельная бизнес-абстракция, а просто
+хендлер логов на уровне `ERROR`+ поверх того же потока (`logging_setup.py`, уже реализован в
+исходной редакции этапа и не меняется по сути). `notifier.py`, `Notifier` Protocol,
+`TelegramNotifier`, `FakeNotifier` и вся связанная проводка через `handlers.py`/`poller.py`/
+`reconcile.py` — удаляются. `.docs/CLAUDE.md` (разделы Logging & Notifications, SOLID/I,D,
+Architecture, Testing, Strict Rules) обновлён под эту модель.
+
+Остаётся актуальным: тонкий агрегат-метод в `repository.py` для дневной сводки (обещан ещё в
+этапе 2), и три места из этапов 5–7, где раньше был только `logger.warning`/`logger.error` —
+теперь дополнительно нужны **INFO-логи на успешные пути** (их не было вообще), а прежние
+warning/error остаются как есть (просто без вызова `Notifier`, которого больше нет).
+
+**Известное решение**: планировка дневной сводки (сравнение текущего времени с
+`DAILY_SUMMARY_TIME`, разовый вызов раз в сутки) — не в этом этапе, это `main.py` (этап 9,
+третий таймер поверх двух daemon-потоков). Здесь только `JobRepository.daily_counts(since)`;
+`main.py` в конце вызовет его и запишет один `logger.info(...)` с числами.
+
+**Известное отклонение**: `daily_counts` считает `disabled` только по журналу WP-заданий
+(`event='deprovision', status='done'`) — отключения, сделанные `reconcile.py` (этап 7), туда не
+попадают: у сверки нет `job_id`/`idempotency_key`, её результаты сознательно не пишутся в `jobs`
+(см. этап 7). Массовые reconcile-отключения и так видны как `ERROR` в логе при abort и `INFO` при
+обычном отключении; заводить отдельный счётчик под сводку — не в рамках этого этапа.
+
+**Пересмотрено повторно**: изначально `logging_setup.py` дополнительно содержал
+`TelegramLogHandler` (прямой пуш `ERROR`+ записей в Telegram Bot API из кода сервиса, с
+флуд-защитой). Пользователь пояснил инфраструктуру: два сервиса в отдельных контейнерах пишут в
+общий Loki (третий контейнер), поверх которого — Grafana с дашбордом; оповещение в мессенджер,
+если понадобится, будет настроено как Grafana Alerting (LogQL-правило по `level="error"` +
+Telegram contact point), а не прямым пушем из приложения. `TelegramLogHandler` и параметры
+`telegram_bot_token`/`telegram_chat_id`/`now` в `configure_logging` — убраны; `TELEGRAM_BOT_TOKEN`/
+`TELEGRAM_CHAT_ID` убраны из `Settings`, `.env.example`, `.docs/CLAUDE.md`. `logging_setup.py`
+теперь строго про file + Loki + redaction — без knowledge о мессенджерах.
+
+### Файлы
+
+| Файл | Статус | Роль |
+|---|---|---|
+| `src/logging_setup.py` | новый | `RedactionFilter`, `LokiHandler`, `configure_logging()` (file + Loki) |
+| `src/repository.py` | правка | `DailyCounts` (dataclass) + `JobRepository.daily_counts(since)` |
+| `src/config.py` | правка | `Settings` без `telegram_bot_token`/`telegram_chat_id` |
+| `src/handlers.py` | правка | `ProvisionHandler`/`PromoteHandler`/`DeprovisionHandler` — INFO-логи на успешные пути |
+| `src/poller.py` | правка | `Poller` — INFO-лог на успешную обработку задания |
+| `src/reconcile.py` | правка | `Reconciler` — INFO-лог на успешный прогон (сколько отключено) |
+| `tests/test_logging_setup.py` | новый | покрытие `RedactionFilter`, `LokiHandler`, монтаж `configure_logging` |
+| `tests/test_repository.py` | правка | тест на `daily_counts` |
+| `tests/test_handlers.py`, `tests/test_poller.py`, `tests/test_reconcile.py` | правка | новые ассерты на INFO-логи (`caplog`) вместо `FakeNotifier` |
+
+### `src/logging_setup.py`
+
+- `_SENSITIVE_PATTERN = re.compile(r"(?i)(password|unicodePwd)=(?:'[^']*'|\"[^\"]*\"|\S+)")`.
+- `class RedactionFilter(logging.Filter)`:
+  - `def filter(self, record: logging.LogRecord) -> bool` — берёт `record.getMessage()`
+    (уже подставленные `%`-аргументы), прогоняет через `_SENSITIVE_PATTERN.sub(...)`
+    (`password=***`); если текст изменился — `record.msg = redacted`, `record.args = ()` (иначе
+    хендлер попытается повторно подставить аргументы в уже готовую строку); возвращает `True`
+    всегда (не режет записи, только чистит текст). Навешивается на **каждый** хендлер
+    (`handler.addFilter(...)`) в `configure_logging`, а не на логгер — фильтры логгера-предка не
+    применяются к записям от логгеров-потомков при штатном распространении, только фильтры самого
+    хендлера гарантированно видят все записи независимо от исходного `adsync.<module>`.
+- `class LokiHandler(logging.Handler)`:
+  - `__init__(self, loki_url: str, *, service: str = "fs-adsync", transport:
+    httpx.BaseTransport | None = None) -> None` — `httpx.Client(base_url=loki_url, timeout=5.0,
+    transport=transport)`.
+  - `def emit(self, record: logging.LogRecord) -> None` — формат `POST /loki/api/v1/push`:
+    `{"streams": [{"stream": {"service": ..., "level": record.levelname.lower()}, "values":
+    [[str(int(record.created * 1e9)), self.format(record)]]}]}` — лейблы низкокардинальные
+    (`service`, `level`), `username`/`idempotency_key` остаются только в тексте строки (в теле
+    `values`), не в `stream`-лейблах, как требует раздел Logging CLAUDE.md; сбой отправки →
+    `self.handleError(record)` (стандартный идиом `logging.Handler`, не роняет процесс).
+  - `def close(self) -> None` — закрывает `httpx.Client`, зовёт `super().close()`.
+- `def configure_logging(*, data_dir: Path, loki_url: str | None, level: int = logging.INFO) -> None`:
+  - Логгер `logging.getLogger("adsync")`: `setLevel(level)`, `propagate = False` (все хендлеры
+    висят прямо на нём, дублировать через root не нужно).
+  - `RotatingFileHandler(data_dir / "logs" / "adsync.log", maxBytes=10 * 1024 * 1024,
+    backupCount=5, encoding="utf-8")` — всегда добавляется.
+  - `LokiHandler(loki_url)` — добавляется, только если `loki_url` задан.
+  - На каждый добавленный хендлер — свой `Formatter("%(asctime)s %(levelname)s %(name)s:
+    %(message)s")` и общий экземпляр `RedactionFilter()` (`handler.addFilter(...)`).
+
+### `src/repository.py` (правка)
+
+- `@dataclass(frozen=True, slots=True) class DailyCounts` — `created: int`, `disabled: int`,
+  `errors: int`.
+- `JobRepository.daily_counts(self, since: datetime) -> DailyCounts` — один `SELECT` с тремя
+  `SUM(CASE WHEN ... THEN 1 ELSE 0 END)` по `jobs WHERE acked_at >= ?` (`since.isoformat()`):
+  `created` = `event='provision' AND status='done'`, `disabled` = `event='deprovision' AND
+  status='done'`, `errors` = `status='failed'` (любой `event`). Сравнение `acked_at` (ISO 8601
+  UTC-строка) через `>=` корректно лексикографически, т.к. формат всегда одинаковый (см.
+  `record()`, этап 2).
+
+### `src/handlers.py` (правка)
+
+- `ProvisionHandler.handle`: `logger.info(...)` на каждом успешном исходе, с указанием, какая
+  именно ветка сработала — новая учётка (`создана учётка %s в %s`), реактивация из «Отчисленных»
+  (`реактивирована учётка %s: %s → %s`), обновление уже существующей в зоне (`обновлена учётка %s
+  в зоне`). Ветка неизвестного `subject_key` — как раньше, `logger.warning(...)`, без вызова
+  `Notifier` (его больше нет).
+- `PromoteHandler.handle`: `logger.info("promote %s: всё на месте", job.username)` на `done`.
+- `DeprovisionHandler.handle`: `logger.info(...)` на `done` — отдельно для «уже не было учётки»,
+  «уже была отключена» и «отключена и перенесена сейчас» (разный смысл, один уровень).
+- Ветки `failed` (вне зоны и т.п.) — как раньше, `logger.error(...)`, без изменений в логике.
+
+### `src/poller.py` (правка)
+
+- `_process`: `logger.info("задание %s (%s) для %s обработано: %s", job.id, job.event,
+  job.username, result.status)` после успешной записи в журнал (после `repository.record(...)`,
+  независимо от `status` — сам факт «дошли до конца без падения» стоит зафиксировать; отдельные
+  `failed`-ветки внутри обработчиков уже дали свой `ERROR` раньше по стеку). Вызов
+  `self._notifier.job_dead(...)` на dead-пороге убирается — остаётся только `logger.error(...)`,
+  как было.
+
+### `src/reconcile.py` (правка)
+
+- `run_once`: перед `return ReconcileResult(tuple(disabled), aborted=False)` — `logger.info("сверка
+  завершена: отключено %d из %d учёток зоны", len(disabled), len(zone_accounts))`.
+- `_abort`: убирается вызов `self._notifier.reconcile_aborted(...)` и сам параметр `notifier` из
+  `__init__` — остаётся только `logger.error("Сверка отменена: %s", reason)`, как было.
+
+### Тесты
+
+`tests/test_logging_setup.py`:
+- `RedactionFilter`: запись с `password='s3cret'` в тексте → в итоговом сообщении `s3cret`
+  отсутствует, есть `password=***`; запись без чувствительных полей не меняется.
+- `LokiHandler` (`MockTransport`): `emit()` шлёт `POST /loki/api/v1/push` с ожидаемыми
+  `stream`-лейблами (`service`, `level`) и текстом строки в `values`; сбой транспорта не роняет
+  вызывающий код (`handleError` перехватывает).
+- `configure_logging` (на `tmp_path`, без реального `loki_url` — чтобы не тестировать реальную
+  сеть): файл лога создаётся по `data_dir/logs/adsync.log`; при `loki_url=None` на логгере
+  `adsync` — только file-хендлер; при заданном `loki_url` — file + Loki.
+
+`tests/test_repository.py` (доп.):
+- `daily_counts`: журнал с записями `provision/done`, `deprovision/done`, `promote/failed` и одной
+  записью **до** `since` — попадает в выборку только то, что `acked_at >= since`; числа совпадают
+  с ожидаемыми по каждой категории.
+
+`tests/test_handlers.py`, `tests/test_poller.py`, `tests/test_reconcile.py` (правка):
+- `FakeNotifier` и связанная проводка из конструкторов убираются;
+- тест неизвестного `subject_key` (`test_handlers.py`) — как раньше, проверяет `caplog` на
+  `WARNING`, без ассертов на `Notifier`;
+- новые ассерты через `caplog.at_level(logging.INFO, ...)`: успешный `provision`/`promote`/
+  `deprovision` (`test_handlers.py`) даёт запись уровня INFO с ожидаемым username; успешная
+  обработка задания в `test_poller.py` даёт INFO после записи в журнал; успешный прогон без abort
+  в `test_reconcile.py` даёт INFO с числом отключённых.
+
+### Проверка перед завершением этапа
+
+```
+uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
+```
+
+Зависимости новые не нужны — `httpx` уже в проекте (этап 0/3).
 
 ---

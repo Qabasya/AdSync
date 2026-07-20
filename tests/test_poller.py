@@ -81,7 +81,9 @@ def _rows(db_path: Path) -> list[sqlite3.Row]:
     return rows
 
 
-def test_mixed_batch_acks_and_journals_each_job(tmp_path: Path) -> None:
+def test_mixed_batch_acks_and_journals_each_job(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     directory = make_directory()
     directory.create_user(ou_dn=OU_SUBJECT, username="petrov", first="Пётр", last="Петров")
     directory.create_user(ou_dn=OU_SUBJECT, username="sidorov", first="Сидор", last="Сидоров")
@@ -105,7 +107,8 @@ def test_mixed_batch_acks_and_journals_each_job(tmp_path: Path) -> None:
     handlers = make_handlers(directory)
     poller = make_poller(lms, repository, handlers)
 
-    poller.run_once()
+    with caplog.at_level(logging.INFO, logger="adsync.poller"):
+        poller.run_once()
     repository.close()
 
     assert [ack.id for ack in lms.acks] == [1, 2, 3]
@@ -120,6 +123,7 @@ def test_mixed_batch_acks_and_journals_each_job(tmp_path: Path) -> None:
     assert by_job_id[3]["subject_key"] is None
     assert by_job_id[1]["received_at"] == _NOW.isoformat()
     assert by_job_id[1]["acked_at"] == _NOW.isoformat()
+    assert "обработано: done" in caplog.text
 
 
 def test_handler_error_is_isolated_and_batch_continues(tmp_path: Path) -> None:

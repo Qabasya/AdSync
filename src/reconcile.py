@@ -66,12 +66,12 @@ class Reconciler:
             active_usernames = set(self._lms.get_active_usernames())
         except Exception:
             logger.exception("не удалось получить список активных логинов из LMS")
-            return ReconcileResult((), aborted=True, abort_reason="сбой получения списка от LMS")
+            return self._abort("сбой получения списка от LMS")
 
         if not active_usernames and zone_accounts:
-            reason = "пустой список активных логинов от LMS при непустой управляемой зоне"
-            logger.error("Сверка отменена: %s", reason)
-            return ReconcileResult((), aborted=True, abort_reason=reason)
+            return self._abort(
+                "пустой список активных логинов от LMS при непустой управляемой зоне"
+            )
 
         grace_cutoff = self._now() - timedelta(minutes=self._grace_minutes)
         stale = [
@@ -81,17 +81,13 @@ class Reconciler:
         ]
 
         if len(stale) > self._max_disable:
-            reason = f"к отключению {len(stale)} учёток, порог {self._max_disable}"
-            logger.error("Сверка отменена: %s", reason)
-            return ReconcileResult((), aborted=True, abort_reason=reason)
+            return self._abort(f"к отключению {len(stale)} учёток, порог {self._max_disable}")
 
         if len(stale) * 100 > self._max_disable_pct * len(zone_accounts):
-            reason = (
+            return self._abort(
                 f"к отключению {len(stale)} из {len(zone_accounts)} "
                 f"(порог {self._max_disable_pct}% зоны)"
             )
-            logger.error("Сверка отменена: %s", reason)
-            return ReconcileResult((), aborted=True, abort_reason=reason)
 
         disabled: list[str] = []
         for account in stale:
@@ -99,4 +95,11 @@ class Reconciler:
             self._directory.move_to_ou(account.dn, self._ou_disabled)
             disabled.append(account.username)
 
+        logger.info(
+            "сверка завершена: отключено %d из %d учёток зоны", len(disabled), len(zone_accounts)
+        )
         return ReconcileResult(tuple(disabled), aborted=False)
+
+    def _abort(self, reason: str) -> ReconcileResult:
+        logger.error("Сверка отменена: %s", reason)
+        return ReconcileResult((), aborted=True, abort_reason=reason)

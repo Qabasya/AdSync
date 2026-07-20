@@ -88,7 +88,5 @@ class Settings(BaseSettings):
     daily_summary_time: str | None = None
 
     loki_url: str | None = None
-    telegram_bot_token: str | None = None
-    telegram_chat_id: str | None = None
 
     api_port: int = 8091

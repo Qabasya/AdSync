@@ -45,7 +45,7 @@ uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
 
 - Python 3.12+, менеджер — **uv** (`pyproject.toml` + `uv.lock`, src-layout)
 - pydantic v2 + pydantic-settings — `Settings`, валидация `subjects.yaml`, discriminated union заданий
-- httpx — WP REST, Telegram Bot API, push в Loki (один клиент на три роли)
+- httpx — WP REST, push в Loki
 - ldap3 — LDAPS; установка пароля только через `extend.microsoft.modify_password`
 - PyYAML — `subjects.yaml` (dev: `types-PyYAML` для mypy strict)
 - sqlite3 (stdlib) — журнал; **без ORM и без SQLAlchemy**
@@ -74,10 +74,10 @@ SOLID здесь — про границы, а не про количество 
 - **S** — модуль отвечает за одно: poller не знает про LDAP, шлюзы не знают про бизнес-правила, репозиторий не знает про ack.
 - **O** — новый тип события от WP = новый класс-обработчик + строка в реестре-словаре в `main.py`; существующий код не правится.
 - **L** — реализации Protocol полностью взаимозаменяемы (боевые классы и фейки в тестах).
-- **I** — четыре узких Protocol: `JobHandler`, `LmsApi`, `DirectoryGateway`, `Notifier`.
-- **D** — httpx / ldap3 / sqlite3 живут только внутри `lms.py` / `ad.py` / `repository.py` (httpx дополнительно — в лог-хендлерах и `notifier.py`); остальной код зависит от Protocol; конкретика подключается в `main.py`.
+- **I** — три узких Protocol: `JobHandler`, `LmsApi`, `DirectoryGateway`.
+- **D** — httpx / ldap3 / sqlite3 живут только внутри `lms.py` / `ad.py` / `repository.py` (httpx дополнительно — в лог-хендлерах `logging_setup.py`); остальной код зависит от Protocol; конкретика подключается в `main.py`.
 
-Сознательно **не** вводим: EventBus (вместо него `Notifier` с явными методами), APScheduler (два daemon-потока `while not stop.wait(interval)`), вложенные пакеты (модули плоские — семейств стратегий здесь нет), use-case-слои, иерархии собственных исключений.
+Сознательно **не** вводим: EventBus и отдельный слой бизнес-уведомлений (вместо них — единый канал `logging`, а мессенджер-алертинг, если понадобится, настраивается поверх Loki в Grafana Alerting, не в коде сервиса), APScheduler (два daemon-потока `while not stop.wait(interval)`), вложенные пакеты (модули плоские — семейств стратегий здесь нет), use-case-слои, иерархии собственных исключений.
 
 ## Architecture
 
@@ -92,8 +92,7 @@ SOLID здесь — про границы, а не про количество 
 | `poller.py` | Цикл заданий: fetch → dispatch → ack → журнал; последовательная обработка |
 | `reconcile.py` | Сверка: список от WP против активных учёток зоны; предохранители |
 | `repository.py` | SQLite-журнал (append-only), dead-счётчик; ни пароля, ни сырых payload |
-| `notifier.py` | `Notifier` (Protocol) + `TelegramNotifier`: dead job, unknown subject, abort сверки, дневная сводка |
-| `logging_setup.py` | Хендлеры file / loki / telegram + redaction-фильтр пароля |
+| `logging_setup.py` | Хендлеры file / loki + redaction-фильтр пароля — единственный канал уведомлений; мессенджер-алертинг (если понадобится) — поверх Loki в Grafana |
 | `api.py` | FastAPI: `GET /health`, `GET /status`, `POST /reconcile` — без бизнес-логики |
 
 ### Design Patterns
@@ -125,24 +124,26 @@ SOLID здесь — про границы, а не про количество 
 
 Правила поверх таблицы:
 
-- **Незнакомый `subject_key`**: создать учётку в `AD_OU_FALLBACK` без группы направления → `done` + WARNING + уведомление `Notifier`. Не падать — ученик должен войти немедленно, маппинг админ дополнит потом.
+- **Незнакомый `subject_key`**: создать учётку в `AD_OU_FALLBACK` без группы направления → `done` + WARNING в лог. Не падать — ученик должен войти немедленно, маппинг админ дополнит потом.
 - **provision, а учётка уже существует**: в OU управляемой зоны → ensure (пароль из payload + членство в группе) → `done`; в `AD_OU_DISABLED` → **реактивация** (включить, перенести в OU направления по `subject_key`, пароль, группа) → `done`; **вне управляемой зоны → `failed` + ERROR, объект не трогать** — это чужая учётка.
 - **promote** для отсутствующей или отключённой учётки → `failed` (WP отретраит; после dead разбирается человек).
 - **deprovision**: учётки нет → `done` (цель достигнута); уже отключена → `done`; вне зоны → `failed` + ERROR.
 - Обработчики **идемпотентны**: повторная выдача задания (потерянный ack, падение посреди обработки) переносится спокойно; «уже существует» / «уже в группе» / «уже отключена» — успех, не ошибка.
 - `idempotency_key` — ключ журнала и dead-счётчика, **не барьер**: при повторной выдаче работа выполняется заново (идемпотентно) и ack отправляется снова.
-- **Dead**: наш 6-й `ack(failed)` по одному `idempotency_key` ⇒ `Notifier.job_dead(...)` → ERROR + Telegram. WP о «мёртвых» заданиях наружу не сообщает — этот сервис единственный источник тревоги.
+- **Dead**: наш 6-й `ack(failed)` по одному `idempotency_key` ⇒ ERROR в лог. WP о «мёртвых» заданиях наружу не сообщает — этот сервис единственный источник тревоги.
+- Успешные действия (создание учётки, реактивация, `promote`/`deprovision` → `done`) логируются на уровне INFO — единый аудиторский след в логах, отдельного канала бизнес-событий нет.
 
 ### Сверка (reconcile)
 
 - Управляемая зона: все `ou_dn` из `subjects.yaml` + `AD_OU_FALLBACK`. `AD_OU_DISABLED` — вне сверки.
 - Активная учётка зоны, чьего `sAMAccountName` нет в списке от WP → путь deprovision (отключить + перенести в «Отчисленные»).
-- **Предохранители** — нарушение любого ⇒ ничего не отключать, ERROR + `Notifier.reconcile_aborted(...)`:
+- **Предохранители** — нарушение любого ⇒ ничего не отключать, ERROR в лог:
   - пустой список при непустой зоне — abort всегда;
   - к отключению больше `RECONCILE_MAX_DISABLE` учёток — abort;
   - к отключению больше `RECONCILE_MAX_DISABLE_PCT`% зоны — abort.
 - Grace: учётки с `whenCreated` моложе `RECONCILE_GRACE_MINUTES` не трогаются (гонка со свежим provision против чуть устаревшего списка).
 - Сверка **односторонняя**: никого не включает, не создаёт и не переносит обратно.
+- Успешный прогон без abort логируется на уровне INFO (сколько отключено, если есть).
 
 ### config/subjects.yaml
 
@@ -175,12 +176,27 @@ subjects:
 
 ## Logging & Notifications
 
+Единый канал: всё, что происходит в сервисе — успешные операции, предупреждения, ошибки —
+проходит через стандартный `logging`. Отдельного слоя бизнес-уведомлений в коде сервиса нет.
+Оба сервиса инфраструктуры (этот и fs-video-ingest) пишут в общий Loki; если понадобится
+оповещение в мессенджер — это Grafana Alerting поверх Loki (LogQL-правило + contact point),
+настраивается руками в Grafana, не в этом репозитории.
+
 - Только stdlib `logging`; хендлеры собирает `logging_setup.py`:
   - file — `RotatingFileHandler` `DATA_DIR/logs/adsync.log` (10 MiB × 5), всегда включён;
-  - loki — HTTP push (`/loki/api/v1/push`) при заданном `LOKI_URL`. **Loki общий для всей инфраструктуры** (тот же контейнер, что у fs-video-ingest); лейблы потока только низкокардинальные: `service="fs-adsync"`, `level`. `username`/`idempotency_key` — в тексте строки, не в лейблах;
-  - telegram — только `ERROR`+, при `TELEGRAM_*`; флуд-защита (одинаковый текст не чаще 1 раза в 30 с).
+  - loki — HTTP push (`/loki/api/v1/push`) при заданном `LOKI_URL`. **Loki общий для всей инфраструктуры** (тот же контейнер, что у fs-video-ingest); лейблы потока только низкокардинальные: `service="fs-adsync"`, `level`. `username`/`idempotency_key` — в тексте строки, не в лейблах.
 - **Redaction-фильтр** (`logging.Filter`): значения полей `password`/`unicodePwd` вырезаются из любых записей до форматирования.
-- Бизнес-уведомления ≠ логи: `Notifier` (Protocol) с явными методами — `job_dead`, `unknown_subject`, `reconcile_aborted`, `daily_summary` (создано/отключено/ошибок за сутки; время `DAILY_SUMMARY_TIME`, пусто = выключено). Реализация — Telegram Bot API через httpx.
+- Уровни осознанно расставлены по всему коду:
+  - INFO — успешные операции: создание/реактивация учётки, `promote`/`deprovision` → `done`,
+    успешный прогон сверки (сколько отключено, если есть);
+  - WARNING — некритичные аномалии, не требующие немедленной реакции: незнакомый `subject_key`;
+  - ERROR — требует внимания: учётка/операция вне управляемой зоны, dead-задание (6-я подряд
+    неудача по `idempotency_key`), abort сверки любым предохранителем, сбои сети к LMS/AD. Именно
+    по `level="error"` в Loki будет строиться Grafana-алерт, если/когда его настроят.
+- Дневная сводка (создано/отключено/ошибок за сутки; время `DAILY_SUMMARY_TIME`, пусто =
+  выключено) — отдельный INFO-лог с агрегатами из `JobRepository.daily_counts(...)`, считается и
+  пишется в `main.py`; уровень INFO — под Grafana-алерт по `level="error"` не подпадает, это
+  плановый отчёт для file/Loki, не тревога.
 
 ## Configuration
 
@@ -208,7 +224,6 @@ subjects:
 | `TZ_NAME` | `Europe/Moscow` | Время сводки и grace-расчётов |
 | `DAILY_SUMMARY_TIME` | — | `HH:MM` дневной сводки (пусто = выкл) |
 | `LOKI_URL` | — | Опция |
-| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | — | Опция |
 | `API_PORT` | `8091` | FastAPI (8090 занят fs-video-ingest — не путать) |
 
 ## HTTP API
@@ -228,8 +243,8 @@ subjects:
 
 ## Testing
 
-- pytest; `tests/` зеркалит `src/`. Фейки: `FakeLmsApi`, `FakeDirectoryGateway`, `FakeNotifier`; журнал на tmp SQLite; время — подменой `now()`.
-- В тестах запрещены: сеть, реальный AD/WP/Telegram/Loki.
+- pytest; `tests/` зеркалит `src/`. Фейки: `FakeLmsApi`, `FakeDirectoryGateway`; журнал на tmp SQLite; время — подменой `now()`.
+- В тестах запрещены: сеть, реальный AD/WP/Loki.
 - Обязательное покрытие: HMAC-подпись (векторы из `FS_LMS_API.md`), валидация моделей заданий, все три обработчика (повторная выдача; существующая учётка в зоне / в «Отчисленных» (реактивация) / вне зоны; незнакомый `subject_key`), poller (ack при успехе и ошибке, невалидное задание, изоляция ошибок), reconcile (каждый предохранитель, grace, пустой список, односторонность), repository (dead-счётчик, отсутствие пароля в БД), redaction-фильтр (пароль не утекает в записи).
 - Ручная проверка на живых системах — `scripts/smoke.py`: подписанный `GET /ad/jobs?limit=1` (без обработки) + LDAPS bind-check; вне pytest.
 
@@ -244,7 +259,7 @@ subjects:
 
 - pip запрещён; зависимости — только через `uv add` и только по согласованию.
 - **Пароль из payload никогда не логируется и не сохраняется** — ни в SQLite, ни в файлы, ни в уведомления, ни в `/status`; живёт в памяти от `get_jobs` до `ack`. Redaction-фильтр обязателен.
-- httpx / ldap3 / sqlite3 — только внутри `lms.py` / `ad.py` / `repository.py` (httpx дополнительно — лог-хендлеры и `notifier.py`); остальной код работает через Protocol.
+- httpx / ldap3 / sqlite3 — только внутри `lms.py` / `ad.py` / `repository.py` (httpx дополнительно — лог-хендлеры `logging_setup.py`); остальной код работает через Protocol.
 - **Управляемая зона** = OU из `subjects.yaml` + `AD_OU_FALLBACK` + `AD_OU_DISABLED`. Объекты вне зоны сервис не читает и не изменяет; попытка операции над чужой учёткой → `failed` + ERROR.
 - Hard-delete объектов AD запрещён всегда и везде.
 - Сверка не может отключить больше порогов из конфига; пустой список при непустой зоне — всегда abort; сверка никого не включает.

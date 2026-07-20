@@ -48,7 +48,9 @@ def make_reconciler(
     )
 
 
-def test_disables_only_accounts_missing_from_active_list() -> None:
+def test_disables_only_accounts_missing_from_active_list(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     directory = make_directory()
     directory.create_user(ou_dn=OU_SUBJECT, username="a", first="A", last="A", created_at=_OLD)
     directory.create_user(ou_dn=OU_SUBJECT, username="b", first="B", last="B", created_at=_OLD)
@@ -56,7 +58,8 @@ def test_disables_only_accounts_missing_from_active_list() -> None:
     lms = FakeLmsApi(active_usernames=["a", "b"])
     reconciler = make_reconciler(directory, lms)
 
-    result = reconciler.run_once()
+    with caplog.at_level(logging.INFO, logger="adsync.reconcile"):
+        result = reconciler.run_once()
 
     assert result.aborted is False
     assert result.disabled_usernames == ("c",)
@@ -64,6 +67,7 @@ def test_disables_only_accounts_missing_from_active_list() -> None:
     assert directory.users_by_username["c"].dn.endswith(OU_DISABLED)
     assert directory.users_by_username["a"].enabled is True
     assert directory.users_by_username["b"].enabled is True
+    assert "отключено 1 из 3" in caplog.text
 
 
 def test_no_action_when_all_accounts_confirmed() -> None:

@@ -39,6 +39,14 @@ _DEAD_COUNT_SQL = """
 SELECT COUNT(*) FROM jobs WHERE idempotency_key = ? AND status = 'failed'
 """
 
+_DAILY_COUNTS_SQL = """
+SELECT
+    SUM(CASE WHEN event = 'provision' AND status = 'done' THEN 1 ELSE 0 END),
+    SUM(CASE WHEN event = 'deprovision' AND status = 'done' THEN 1 ELSE 0 END),
+    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)
+FROM jobs WHERE acked_at >= ?
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class JobLogEntry:
@@ -56,6 +64,15 @@ class JobLogEntry:
     error: str | None
     received_at: datetime
     acked_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class DailyCounts:
+    """Агрегаты журнала за период — данные для `Notifier.daily_summary`."""
+
+    created: int
+    disabled: int
+    errors: int
 
 
 class JobRepository:
@@ -101,6 +118,13 @@ class JobRepository:
             cursor = self._connection.execute(_DEAD_COUNT_SQL, (idempotency_key,))
             (count,) = cursor.fetchone()
         return int(count)
+
+    def daily_counts(self, since: datetime) -> DailyCounts:
+        """Агрегаты по журналу с `acked_at >= since`: успешные provision/deprovision, ошибки."""
+        with self._lock:
+            cursor = self._connection.execute(_DAILY_COUNTS_SQL, (since.isoformat(),))
+            created, disabled, errors = cursor.fetchone()
+        return DailyCounts(created=created or 0, disabled=disabled or 0, errors=errors or 0)
 
     def close(self) -> None:
         """Закрывает соединение с БД (используется при graceful shutdown)."""
