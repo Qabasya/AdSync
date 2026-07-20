@@ -1,0 +1,4 @@
+subjects:
+  inf-ege:                      # subject_key из WP (стабильный слаг направления)
+    ou_dn: "OU=КЕГЭ,OU=Ученики,OU=Пользователи,OU=LocalOffice,DC=fs,DC=loc"
+    group_dn: "CN=KEGE,OU=Группы,OU=LocalOffice,DC=fs,DC=loc"
