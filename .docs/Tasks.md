@@ -882,3 +882,155 @@ uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
 Зависимости новые не нужны — `httpx` уже в проекте (этап 0/3).
 
 ---
+
+## Этап 9 — Composition root, HTTP API, graceful shutdown
+
+Последний этап функциональности: `main.py` собирает всё построенное на этапах 1–8 в работающий
+процесс — два daemon-потока (`jobs`, `reconcile`) + третий поток дневной сводки (условный, только
+если задан `DAILY_SUMMARY_TIME`) + `uvicorn` с локальным `api.py`. Плюс два тонких read-метода в
+`repository.py` для `/status`, обещанных ещё в этапе 2.
+
+**Решение по потокобезопасности AD-соединения**: `ldap3.Connection` не потокобезопасен для
+конкурентного использования из разных потоков. Вместо добавления блокировок в `ad.py` (что
+затронуло бы уже готовый и протестированный код этапа 4) заводим **два независимых
+`AdGateway`** с двумя отдельными LDAPS-соединениями: один — для `poller`-потока (обработчики
+заданий), другой — для `reconcile`-потока и ручного `POST /reconcile`. Оба строятся одинаково
+(`build_ldaps_connection` по тем же настройкам), `verify_zone_exists()` вызывается один раз (конфиг
+общий — второй раз проверять нечего). Отдельно — `POST /reconcile` может выполниться конкурентно с
+плановым тиком сверки (FastAPI/uvicorn гоняет sync-эндпоинты в своём threadpool): это защищено
+`threading.Lock()` вокруг вызова `reconciler.run_once()`, общего для планового потока и ручного
+запуска.
+
+**Известное решение**: `main.py` не покрывается pytest (нужны реальные LDAPS/uvicorn — то же
+исключение, что у `build_ldaps_connection`, этап 4; раздел Testing CLAUDE.md не требует покрытия
+composition root). Чистая логика (`_seconds_until_next_summary`) вынесена в тестируемую функцию.
+`api.py`, в отличие от `main.py`, тестируется полностью — через `fastapi.testclient.TestClient`
+поверх фейковых зависимостей, без реального `main.py`.
+
+### Файлы
+
+| Файл | Статус | Роль |
+|---|---|---|
+| `src/repository.py` | правка | `StatusCounts` (dataclass) + `JobRepository.status_counts()` / `recent_entries(limit)` |
+| `src/api.py` | новый | `AppState`, `create_api(...)`: `GET /health`, `GET /status`, `POST /reconcile` |
+| `src/main.py` | новый | Composition root: `Settings` → зависимости → потоки → `uvicorn`; graceful shutdown |
+| `tests/test_repository.py` | правка | тесты на `status_counts`/`recent_entries` |
+| `tests/test_api.py` | новый | покрытие `api.py` на `TestClient` + фейковых зависимостях |
+| `tests/test_main.py` | новый | покрытие чистой функции `_seconds_until_next_summary` |
+
+### `src/repository.py` (правка)
+
+- `@dataclass(frozen=True, slots=True) class StatusCounts` — `done: int`, `failed: int`, `dead: int`.
+- `JobRepository.status_counts(self) -> StatusCounts` — `done`/`failed` — суммарные счётчики по
+  всему журналу (`SUM(CASE WHEN status=... THEN 1 ELSE 0 END)`); `dead` — количество **различных**
+  `idempotency_key`, у которых `COUNT(status='failed') >= 6` (тот же порог, что `_DEAD_THRESHOLD` в
+  `poller.py`; константа продублирована как `_DEAD_THRESHOLD = 6` — это фиксированное бизнес-правило
+  из CLAUDE.md, не настройка, дублирование одного числа в двух местах допустимо и не требует общей
+  абстракции).
+- `JobRepository.recent_entries(self, limit: int) -> list[JobLogEntry]` — последние `limit` записей
+  журнала, `ORDER BY id DESC`; собирает `JobLogEntry` из сырых строк (`datetime.fromisoformat` для
+  `received_at`/`acked_at`). Пароля/payload в схеме нет в принципе — фильтровать нечего.
+
+### `src/api.py`
+
+- `@dataclass class AppState` — `last_jobs_poll_at: datetime | None = None`,
+  `last_reconcile_at: datetime | None = None`. Мутируется из `main.py` после каждого тика; читается
+  эндпоинтом `/health`. Простое присваивание одного поля атомарно под GIL — отдельная блокировка не
+  нужна для этих двух независимых полей.
+- Pydantic-модели ответов: `HealthResponse`, `JournalEntryResponse`, `StatusResponse`,
+  `ReconcileResponse` — по контракту раздела HTTP API CLAUDE.md.
+- `def create_api(*, state: AppState, repository: JobRepository, run_reconcile: Callable[[],
+  ReconcileResult]) -> FastAPI`:
+  - `GET /health` → `HealthResponse(status="ok", last_jobs_poll_at=state.last_jobs_poll_at,
+    last_reconcile_at=state.last_reconcile_at)`.
+  - `GET /status` → `repository.status_counts()` + `repository.recent_entries(20)`, сериализованные
+    в `StatusResponse`.
+  - `POST /reconcile` → зовёт инжектированный `run_reconcile()` (это не `Reconciler.run_once()`
+    напрямую — обёртка из `main.py`, которая **и** обновляет `state.last_reconcile_at`, **и** берёт
+    тот же `threading.Lock()`, что и плановый поток сверки, чтобы не тестировать/дублировать эту
+    логику внутри `api.py`) → `ReconcileResponse`.
+  - Никакой бизнес-логики в самом `api.py` — только формирование ответа и делегирование уже готовым
+    вызываемым объектам, инжектированным из `main.py` (композиция).
+
+### `src/main.py`
+
+- `def _now() -> datetime` — `datetime.now(UTC)`, единственный источник времени процесса.
+- `def _build_ad_gateway(settings: Settings, subjects: dict[str, SubjectConfig]) -> AdGateway` —
+  строит `AdGateway` с собственным LDAPS-соединением и `reconnect`-замыканием
+  (`build_ldaps_connection` по `settings.ldap_*`); вызывается дважды в `main()` (для jobs и для
+  reconcile — см. решение по потокобезопасности выше).
+- `def _seconds_until_next_summary(target_time: str, tz: ZoneInfo, now: datetime) -> float` —
+  чистая функция: парсит `"HH:MM"`, считает секунды до ближайшего срабатывания в таймзоне `tz`
+  относительно `now` (если время сегодня уже прошло — берёт завтра). Вынесена отдельно ради теста.
+- `def _loop(stop: threading.Event, interval_seconds: float, tick: Callable[[], object], label:
+  str) -> None` — общий идиом `while not stop.wait(interval_seconds): tick()` (раздел SOLID
+  CLAUDE.md) с `try/except Exception: logger.exception(...)` вокруг `tick()`, чтобы одна ошибка
+  тика не убила поток.
+- `def _daily_summary_loop(stop: threading.Event, settings: Settings, repository: JobRepository) ->
+  None` — отдельный от `_loop` цикл (интервал не фиксированный, а «до следующего HH:MM»):
+  `while not stop.wait(_seconds_until_next_summary(...)): logger.info("дневная сводка: ...",
+  *repository.daily_counts(_now() - timedelta(hours=24)))`, в `try/except` аналогично `_loop`.
+- `def main() -> None`:
+  1. `settings = Settings()`; `configure_logging(data_dir=settings.data_dir,
+     loki_url=settings.loki_url)`.
+  2. `subjects = load_subjects(settings.subjects_file)`.
+  3. `jobs_directory = _build_ad_gateway(...)`; `reconcile_directory = _build_ad_gateway(...)`;
+     `jobs_directory.verify_zone_exists()` (fail fast — `ManagedZoneConfigError` наружу, процесс не
+     стартует).
+  4. `lms = LmsClient(settings.lms_base_url, settings.fs_lms_ad_hmac_secret)`.
+  5. `repository = JobRepository(settings.data_dir / "state.db")`.
+  6. Реестр `handlers: dict[str, JobHandler]` — `ProvisionHandler`/`PromoteHandler`/
+     `DeprovisionHandler` на `jobs_directory` (новый тип события = новая строка реестра, без правки
+     остального кода — раздел SOLID/O CLAUDE.md).
+  7. `poller = Poller(...)`, `reconciler = Reconciler(..., reconcile_directory, ...)`.
+  8. `state = AppState()`; `reconcile_lock = threading.Lock()`; `stop = threading.Event()`.
+  9. `run_jobs_tick()`/`run_reconcile_tick()` — локальные замыкания, обновляющие `state.*_at` после
+     вызова `poller.run_once()`/`reconciler.run_once()` (второе — под `reconcile_lock`).
+  10. Запуск потоков: `jobs` (`_loop`, `settings.jobs_poll_seconds`), `reconcile` (`_loop`,
+      `settings.reconcile_interval_hours * 3600`), `daily-summary` (только если
+      `settings.daily_summary_time` задан) — все `daemon=True`.
+  11. `app = create_api(state=state, repository=repository, run_reconcile=run_reconcile_tick)`;
+      `server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=settings.api_port,
+      log_config=None))`; `uvicorn` запускается в **своём** потоке (`threading.Thread(target=
+      server.run)`) — по исходникам `uvicorn.Server.install_signal_handlers()` сам пропускает
+      установку обработчиков сигналов, если вызван не из главного потока, поэтому сигналами
+      управляет только `main()`, без конфликта с uvicorn.
+  12. `signal.signal(SIGTERM/SIGINT, ...)` в главном потоке: `logger.info(...)` → `stop.set()` →
+      `server.should_exit = True` (просит uvicorn завершиться после текущих запросов).
+  13. `stop.wait()` (блокирует главный поток до сигнала) → `join(timeout=10)` на все потоки →
+      `lms.close()`, `repository.close()`, `jobs_directory.close()`, `reconcile_directory.close()`.
+- Это и есть **graceful shutdown** из раздела Job Processing Rules CLAUDE.md: `run_once()` внутри
+  `_loop` не прерывается на середине — `stop.wait()` проверяется только между тиками, поэтому
+  текущее задание/сверка всегда дообрабатываются до конца перед выходом из цикла.
+- `if __name__ == "__main__": main()`.
+
+### Тесты
+
+`tests/test_repository.py` (доп.):
+- `status_counts`: журнал с несколькими `done`/`failed` по разным `idempotency_key`, один ключ с
+  6 `failed` подряд → `dead == 1`, остальные ключи с < 6 `failed` в `dead` не попадают.
+- `recent_entries`: `limit` меньше числа записей в журнале → возвращаются именно последние `limit`
+  (по `id DESC`), с корректно распарсенными `datetime`.
+
+`tests/test_api.py` (`fastapi.testclient.TestClient`, без реального `main.py`/сети):
+- `GET /health` возвращает `status="ok"` и значения из подставленного `AppState` (включая `None`,
+  если тика ещё не было).
+- `GET /status` возвращает счётчики из фейкового/тестового `JobRepository` (реальный на `tmp_path`,
+  как в `test_repository.py`) и не более `20` последних записей.
+- `POST /reconcile` зовёт инжектированный `run_reconcile` ровно один раз и возвращает его результат
+  в ожидаемой форме (`aborted`, `abort_reason`, `disabled_usernames`).
+
+`tests/test_main.py`:
+- `_seconds_until_next_summary`: время ещё не наступило сегодня → секунды до сегодняшнего HH:MM;
+  время уже прошло сегодня → секунды до завтрашнего HH:MM (проверить на границе — `now` ровно равен
+  целевому времени, тоже уходит на завтра, чтобы не спамить сводку дважды в одну и ту же минуту).
+
+### Проверка перед завершением этапа
+
+```
+uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
+```
+
+Зависимости новые не нужны — `fastapi`/`uvicorn` уже в проекте (этап 0).
+
+---
