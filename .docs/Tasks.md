@@ -189,3 +189,78 @@ uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
 ```
 
 Зависимости новые не нужны — `sqlite3`/`threading`/`dataclasses` — stdlib.
+
+---
+
+## Этап 3 — LMS-клиент
+
+### Файлы
+
+| Файл | Статус | Роль |
+|---|---|---|
+| `src/lms.py` | новый | `LmsApi` (Protocol) + `LmsClient` (httpx): `get_jobs`/`ack`/`get_active_usernames`, HMAC-подпись |
+| `tests/fakes.py` | новый | `FakeLmsApi` — in-memory реализация `LmsApi` для тестов будущих этапов (poller, handlers, reconcile) |
+| `tests/test_lms.py` | новый | покрытие `LmsClient`: подпись, парсинг, отсутствие ретраев |
+
+### `src/lms.py`
+
+- `class LmsApi(Protocol)`:
+  - `def get_jobs(self, limit: int) -> list[Job]: ...`
+  - `def ack(self, request: AckRequest) -> None: ...`
+  - `def get_active_usernames(self) -> list[str]: ...`
+- `class LmsClient`:
+  - `__init__(self, base_url: str, hmac_secret: str, *, timeout: float = 15.0, transport:
+    httpx.BaseTransport | None = None) -> None` — держит `httpx.Client(base_url=..., timeout=...,
+    transport=...)`. Параметр `transport` — исключительно для тестов (внедрение
+    `httpx.MockTransport`, без реальной сети); в проде остаётся `None` (обычный сетевой transport).
+  - `_signed_headers(self, body: str) -> dict[str, str]` — точная формула `FS_LMS_API.md` §2:
+    `ts = str(int(time.time()))`, `sig = hmac.new(secret.encode(), f"{ts}.{body}".encode(),
+    hashlib.sha256).hexdigest()`, заголовки `X-Fs-Timestamp`/`X-Fs-Signature`. Только stdlib
+    `time`/`hmac`/`hashlib`.
+  - `get_jobs(self, limit: int) -> list[Job]` — `GET /ad/jobs?limit=…` с подписью по пустому телу
+    (`""` для GET), `raise_for_status()`, парсинг тела через `JobsResponse.model_validate(...).jobs`.
+  - `ack(self, request: AckRequest) -> None` — `POST /ad/ack`; тело —
+    `request.model_dump_json(exclude_none=True)` (если `error is None`, поле в JSON не отправляется;
+    `sam_account_name` не отправляем — его нет в `AckRequest`); подпись считается **по тем же самым
+    байтам**, что реально уходят в теле запроса; `raise_for_status()`.
+  - `get_active_usernames(self) -> list[str]` — `GET /ad/active-usernames`, отдельный больший
+    таймаут (`timeout=30.0` на этот конкретный запрос — список может быть большим), парсинг через
+    `ActiveUsernamesResponse.model_validate(...).usernames`.
+  - `close(self) -> None` — закрывает `httpx.Client`.
+  - **Без собственных ретраев**: любая сетевая ошибка/`4xx`/`5xx` просто пробрасывается наружу
+    (`httpx.HTTPError` и наследники) — решение, что делать дальше (следующий тик / `ack(failed)`),
+    принимает вызывающий код (`poller.py`, этап 6), не `lms.py`.
+
+### `tests/fakes.py`
+
+- `class FakeLmsApi` — реализует `LmsApi` без сети: конструктор принимает начальный список
+  `jobs: list[Job]` и `active_usernames: list[str]`; `get_jobs(limit)` возвращает срез списка;
+  `ack(request)` копит вызовы в `self.acks: list[AckRequest]` (для проверки в тестах будущих
+  этапов, что и с каким статусом было отправлено); `get_active_usernames()` возвращает список как
+  есть. Без задержек, без ошибок по умолчанию — усложнения (эмуляция сетевых сбоев и т.п.)
+  добавляются в тот этап, где они реально понадобятся конкретному тесту.
+
+### Тесты (`tests/test_lms.py`, сеть запрещена — `httpx.MockTransport` вместо реальных запросов)
+
+- `get_jobs`: запрос уходит на `GET /ad/jobs` с `limit` в query, тело для подписи — пустая строка;
+  заголовок `X-Fs-Signature` **пересчитывается независимо** в тесте по формуле из
+  `FS_LMS_API.md` §2 (тот же `hmac.new(secret, f"{ts}.{body}", sha256).hexdigest()`, где `ts` берём
+  из фактически отправленного `X-Fs-Timestamp`) и сверяется с тем, что реально отправил клиент —
+  это и есть «вектор» подписи; смешанный ответ (`provision`/`promote`/`deprovision`) корректно
+  парсится в `list[Job]`.
+- `ack`: тело запроса — валидный JSON с `id`/`status` и без `sam_account_name`; при `error=None`
+  поле `error` в теле отсутствует, при заданном `error` — присутствует; подпись пересчитывается по
+  **фактически отправленным байтам тела** и совпадает с заголовком.
+- `get_active_usernames`: `GET /ad/active-usernames`, тело для подписи пустое, ответ
+  `{"usernames": [...]}` парсится в `list[str]`.
+- `5xx`/`4xx` ответ от `GET /ad/jobs` → `LmsClient` не глотает и не ретраит, исключение
+  (`httpx.HTTPStatusError`) пробрасывается наружу.
+
+### Проверка перед завершением этапа
+
+```
+uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
+```
+
+Зависимости новые не нужны — `httpx` уже добавлен на этапе 0; `httpx.MockTransport` — часть самого
+`httpx`, отдельного тестового HTTP-мока (`respx`, `pytest-httpx` и т.п.) не добавляем.
