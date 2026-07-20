@@ -16,7 +16,7 @@ from ldap3 import Connection
 from ad import AdGateway, build_ldaps_connection
 from api import AppState, create_api
 from config import Settings, SubjectConfig, load_subjects
-from handlers import DeprovisionHandler, JobHandler, PromoteHandler, ProvisionHandler
+from handlers import DeprovisionHandler, JobHandler, ProvisionHandler
 from lms import LmsClient
 from logging_setup import configure_logging
 from poller import Poller
@@ -122,7 +122,6 @@ def main() -> None:
         "provision": ProvisionHandler(
             jobs_directory, subjects=subjects, ou_fallback=settings.ad_ou_fallback
         ),
-        "promote": PromoteHandler(jobs_directory),
         "deprovision": DeprovisionHandler(jobs_directory, ou_disabled=settings.ad_ou_disabled),
     }
 

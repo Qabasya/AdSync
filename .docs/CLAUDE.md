@@ -29,7 +29,7 @@ uv run pytest                    # тесты
 uv run ruff format .             # автоформат (PEP 8)
 uv run ruff check --fix .        # линт
 uv run mypy src                  # проверка типов (strict)
-docker compose -f docker/docker-compose.yml up -d --build   # прод-запуск
+docker compose up -d --build      # прод-запуск
 ```
 
 Обязательная проверка перед завершением любого этапа (должна проходить чисто):
@@ -85,10 +85,10 @@ SOLID здесь — про границы, а не про количество 
 |---|---|
 | `main.py` | Composition root: `Settings` → сборка зависимостей → реестр обработчиков (обычный dict `{"provision": …}`) → два daemon-потока + uvicorn; graceful shutdown по SIGTERM |
 | `config.py` | `Settings` (pydantic-settings) + загрузка и валидация `subjects.yaml` |
-| `models.py` | `ProvisionJob \| PromoteJob \| DeprovisionJob` — discriminated union по полю `event`; DTO ack |
+| `models.py` | `ProvisionJob \| DeprovisionJob` — discriminated union по полю `event`; DTO ack |
 | `lms.py` | `LmsApi` (Protocol) + `LmsClient` (httpx): `get_jobs` / `ack` / `get_active_usernames`; HMAC-подпись; таймауты; **без собственных ретраев** |
 | `ad.py` | `DirectoryGateway` (Protocol) + `AdGateway` (ldap3): идемпотентные операции, контроль управляемой зоны, переподключение при обрыве |
-| `handlers.py` | `JobHandler` (Protocol) + `ProvisionHandler` / `PromoteHandler` / `DeprovisionHandler` |
+| `handlers.py` | `JobHandler` (Protocol) + `ProvisionHandler` / `DeprovisionHandler` |
 | `poller.py` | Цикл заданий: fetch → dispatch → ack → журнал; последовательная обработка |
 | `reconcile.py` | Сверка: список от WP против активных учёток зоны; предохранители |
 | `repository.py` | SQLite-журнал (append-only), dead-счётчик; ни пароля, ни сырых payload |
@@ -119,19 +119,23 @@ SOLID здесь — про границы, а не про количество 
 | `event` | payload | Действие |
 |---|---|---|
 | `provision` | `id, event, idempotency_key, username, password, first, last, subject_key` | Создать учётку в OU направления по `subjects.yaml`: `objectClass=user`, `sAMAccountName=username`, `userPrincipalName={username}@{AD_UPN_SUFFIX}`, `cn`/`displayName` из `first`+`last`, включена сразу (`userAccountControl=512`); пароль `unicodePwd` только по LDAPS через `extend.microsoft.modify_password`; `MODIFY_ADD` в security-группу направления |
-| `promote` | `id, event, idempotency_key, username` | Идемпотентная проверка «всё на месте»: существует, включена, в управляемой зоне → `done`; иначе `failed` |
 | `deprovision` | `id, event, idempotency_key, username` | `userAccountControl=514` + `modify_dn` в `AD_OU_DISABLED` |
+
+Событий ровно два — никакой промежуточной стадии «зачислен» в OU-структуре нет: учётка создаётся
+один раз сразу в целевой OU направления и остаётся там до отчисления. Событие `promote` в контракте
+fs-lms не существует (см. `.docs/FS_LMS_API.md`, §3.1, и `.docs/AdSyncPythonService.md`, §3.1) — в
+этом сервисе такой обработчик когда-то был реализован как задел, но убран при сверке с нормативными
+документами модуля `Inc\Modules\AdSync`.
 
 Правила поверх таблицы:
 
 - **Незнакомый `subject_key`**: создать учётку в `AD_OU_FALLBACK` без группы направления → `done` + WARNING в лог. Не падать — ученик должен войти немедленно, маппинг админ дополнит потом.
 - **provision, а учётка уже существует**: в OU управляемой зоны → ensure (пароль из payload + членство в группе) → `done`; в `AD_OU_DISABLED` → **реактивация** (включить, перенести в OU направления по `subject_key`, пароль, группа) → `done`; **вне управляемой зоны → `failed` + ERROR, объект не трогать** — это чужая учётка.
-- **promote** для отсутствующей или отключённой учётки → `failed` (WP отретраит; после dead разбирается человек).
 - **deprovision**: учётки нет → `done` (цель достигнута); уже отключена → `done`; вне зоны → `failed` + ERROR.
 - Обработчики **идемпотентны**: повторная выдача задания (потерянный ack, падение посреди обработки) переносится спокойно; «уже существует» / «уже в группе» / «уже отключена» — успех, не ошибка.
 - `idempotency_key` — ключ журнала и dead-счётчика, **не барьер**: при повторной выдаче работа выполняется заново (идемпотентно) и ack отправляется снова.
 - **Dead**: наш 6-й `ack(failed)` по одному `idempotency_key` ⇒ ERROR в лог. WP о «мёртвых» заданиях наружу не сообщает — этот сервис единственный источник тревоги.
-- Успешные действия (создание учётки, реактивация, `promote`/`deprovision` → `done`) логируются на уровне INFO — единый аудиторский след в логах, отдельного канала бизнес-событий нет.
+- Успешные действия (создание учётки, реактивация, `deprovision` → `done`) логируются на уровне INFO — единый аудиторский след в логах, отдельного канала бизнес-событий нет.
 
 ### Сверка (reconcile)
 
@@ -170,7 +174,7 @@ subjects:
 ## State (SQLite)
 
 - Файл `DATA_DIR/state.db`; режим WAL; доступ — только через `repository.py`; без ORM.
-- Таблица `jobs` — append-only журнал обработок: `id`, `job_id`, `idempotency_key`, `event`, `username`, `subject_key` (NULL для promote/deprovision), `status` (`done`|`failed`), `error` (NULL), `received_at`, `acked_at`. **Пароль и сырой payload не сохраняются никогда.**
+- Таблица `jobs` — append-only журнал обработок: `id`, `job_id`, `idempotency_key`, `event`, `username`, `subject_key` (NULL для `deprovision`), `status` (`done`|`failed`), `error` (NULL), `received_at`, `acked_at`. **Пароль и сырой payload не сохраняются никогда.**
 - Dead-счётчик = `COUNT(status='failed')` по `idempotency_key`; отдельной машины состояний нет — журнал фактов.
 - Времена в БД — UTC ISO 8601.
 
@@ -187,7 +191,7 @@ subjects:
   - loki — HTTP push (`/loki/api/v1/push`) при заданном `LOKI_URL`. **Loki общий для всей инфраструктуры** (тот же контейнер, что у fs-video-ingest); лейблы потока только низкокардинальные: `service="fs-adsync"`, `level`. `username`/`idempotency_key` — в тексте строки, не в лейблах.
 - **Redaction-фильтр** (`logging.Filter`): значения полей `password`/`unicodePwd` вырезаются из любых записей до форматирования.
 - Уровни осознанно расставлены по всему коду:
-  - INFO — успешные операции: создание/реактивация учётки, `promote`/`deprovision` → `done`,
+  - INFO — успешные операции: создание/реактивация учётки, `deprovision` → `done`,
     успешный прогон сверки (сколько отключено, если есть);
   - WARNING — некритичные аномалии, не требующие немедленной реакции: незнакомый `subject_key`;
   - ERROR — требует внимания: учётка/операция вне управляемой зоны, dead-задание (6-я подряд
@@ -207,7 +211,7 @@ subjects:
 | `LMS_BASE_URL` | — | `https://…/wp-json/fs-lms/v1` |
 | `FS_LMS_AD_HMAC_SECRET` | — | Секрет подписи (тот же, что в `wp-config.php`) |
 | `JOBS_POLL_SECONDS` | `3` | Интервал цикла заданий |
-| `JOBS_LIMIT` | `50` | `limit` в `GET /ad/jobs` (1–100) |
+| `JOBS_LIMIT` | `50` | `limit` в `GET /ad/jobs` (1–200) |
 | `RECONCILE_INTERVAL_HOURS` | `6` | Интервал сверки |
 | `RECONCILE_GRACE_MINUTES` | `15` | Grace-период для свежих учёток |
 | `RECONCILE_MAX_DISABLE` | `10` | Порог: максимум отключений за проход |
@@ -245,7 +249,7 @@ subjects:
 
 - pytest; `tests/` зеркалит `src/`. Фейки: `FakeLmsApi`, `FakeDirectoryGateway`; журнал на tmp SQLite; время — подменой `now()`.
 - В тестах запрещены: сеть, реальный AD/WP/Loki.
-- Обязательное покрытие: HMAC-подпись (векторы из `FS_LMS_API.md`), валидация моделей заданий, все три обработчика (повторная выдача; существующая учётка в зоне / в «Отчисленных» (реактивация) / вне зоны; незнакомый `subject_key`), poller (ack при успехе и ошибке, невалидное задание, изоляция ошибок), reconcile (каждый предохранитель, grace, пустой список, односторонность), repository (dead-счётчик, отсутствие пароля в БД), redaction-фильтр (пароль не утекает в записи).
+- Обязательное покрытие: HMAC-подпись (векторы из `FS_LMS_API.md`), валидация моделей заданий, оба обработчика (повторная выдача; существующая учётка в зоне / в «Отчисленных» (реактивация) / вне зоны; незнакомый `subject_key`), poller (ack при успехе и ошибке, невалидное задание, изоляция ошибок), reconcile (каждый предохранитель, grace, пустой список, односторонность), repository (dead-счётчик, отсутствие пароля в БД), redaction-фильтр (пароль не утекает в записи).
 - Ручная проверка на живых системах — `scripts/smoke.py`: подписанный `GET /ad/jobs?limit=1` (без обработки) + LDAPS bind-check; вне pytest.
 
 ## CI (GitHub Actions)

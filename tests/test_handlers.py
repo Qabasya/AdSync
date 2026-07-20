@@ -6,8 +6,8 @@ import pytest
 from fakes import FakeDirectoryGateway
 
 from config import SubjectConfig
-from handlers import DeprovisionHandler, PromoteHandler, ProvisionHandler
-from models import DeprovisionJob, PromoteJob, ProvisionJob
+from handlers import DeprovisionHandler, ProvisionHandler
+from models import DeprovisionJob, ProvisionJob
 
 OU_SUBJECT = "OU=KEGE,OU=Ученики,DC=fs,DC=loc"
 GROUP_SUBJECT = "CN=KEGE,OU=Группы,DC=fs,DC=loc"
@@ -129,58 +129,6 @@ class TestProvisionHandler:
         assert second.status == "done"
         dn = directory.users_by_username["ivanov"].dn
         assert directory.group_members[GROUP_SUBJECT] == {dn}
-
-
-def promote_job(**overrides: object) -> PromoteJob:
-    payload: dict[str, object] = {
-        "id": 2,
-        "event": "promote",
-        "idempotency_key": "key-2",
-        "username": "ivanov",
-    }
-    payload.update(overrides)
-    return PromoteJob.model_validate(payload)
-
-
-class TestPromoteHandler:
-    def test_missing_user_fails(self) -> None:
-        directory = make_directory()
-        handler = PromoteHandler(directory)
-
-        result = handler.handle(promote_job())
-
-        assert result.status == "failed"
-        assert result.error
-
-    def test_enabled_user_in_zone_done(self, caplog: pytest.LogCaptureFixture) -> None:
-        directory = make_directory()
-        directory.create_user(ou_dn=OU_SUBJECT, username="ivanov", first="Иван", last="Иванов")
-        handler = PromoteHandler(directory)
-
-        with caplog.at_level(logging.INFO, logger="adsync.handlers"):
-            result = handler.handle(promote_job())
-
-        assert result.status == "done"
-        assert "ivanov" in caplog.text
-
-    def test_disabled_user_fails(self) -> None:
-        directory = make_directory()
-        dn = directory.create_user(ou_dn=OU_SUBJECT, username="ivanov", first="Иван", last="Иванов")
-        directory.ensure_disabled(dn)
-        handler = PromoteHandler(directory)
-
-        result = handler.handle(promote_job())
-
-        assert result.status == "failed"
-
-    def test_user_outside_zone_fails(self) -> None:
-        directory = make_directory()
-        directory.create_user(ou_dn=OU_OUTSIDE, username="ivanov", first="Иван", last="Иванов")
-        handler = PromoteHandler(directory)
-
-        result = handler.handle(promote_job())
-
-        assert result.status == "failed"
 
 
 def deprovision_job(**overrides: object) -> DeprovisionJob:

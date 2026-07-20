@@ -11,7 +11,7 @@ from typing import Literal, Protocol
 
 from ad import DirectoryGateway
 from config import SubjectConfig
-from models import DeprovisionJob, Job, PromoteJob, ProvisionJob
+from models import DeprovisionJob, Job, ProvisionJob
 
 logger = logging.getLogger("adsync.handlers")
 
@@ -90,24 +90,6 @@ class ProvisionHandler:
 
         logger.error("Учётная запись %s вне управляемой зоны, объект не тронут", job.username)
         return HandlerResult("failed", error="учётная запись вне управляемой зоны")
-
-
-class PromoteHandler:
-    """Обработчик `promote`: идемпотентная проверка «всё на месте»."""
-
-    def __init__(self, directory: DirectoryGateway) -> None:
-        self._directory = directory
-
-    def handle(self, job: Job) -> HandlerResult:
-        assert isinstance(job, PromoteJob)
-
-        user = self._directory.find_user(job.username)
-        if user is None:
-            return HandlerResult("failed", error="учётная запись не найдена")
-        if user.enabled and self._directory.is_in_managed_zone(user.dn):
-            logger.info("promote %s: всё на месте", job.username)
-            return HandlerResult("done")
-        return HandlerResult("failed", error="учётная запись отключена или вне управляемой зоны")
 
 
 class DeprovisionHandler:

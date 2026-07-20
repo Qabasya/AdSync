@@ -1,0 +1,23 @@
+services:
+  adsync:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ_NAME:-Europe/Moscow}
+    volumes:
+      - ./data:/data
+      - ./config:/app/config:ro
+    ports:
+      - "${API_PORT:-8091}:8091"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os,urllib.request; urllib.request.urlopen('http://localhost:' + os.environ.get('API_PORT', '8091') + '/health', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3

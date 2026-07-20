@@ -9,8 +9,8 @@ import pytest
 from fakes import FakeDirectoryGateway, FakeLmsApi
 
 from config import SubjectConfig
-from handlers import DeprovisionHandler, HandlerResult, PromoteHandler, ProvisionHandler
-from models import DeprovisionJob, Job, PromoteJob, ProvisionJob
+from handlers import DeprovisionHandler, HandlerResult, ProvisionHandler
+from models import DeprovisionJob, Job, ProvisionJob
 from poller import Poller
 from repository import JobLogEntry, JobRepository
 
@@ -53,7 +53,6 @@ def make_directory() -> FakeDirectoryGateway:
 def make_handlers(directory: FakeDirectoryGateway) -> dict[str, object]:
     return {
         "provision": ProvisionHandler(directory, subjects=SUBJECTS, ou_fallback=OU_FALLBACK),
-        "promote": PromoteHandler(directory),
         "deprovision": DeprovisionHandler(directory, ou_disabled=OU_DISABLED),
     }
 
@@ -85,7 +84,6 @@ def test_mixed_batch_acks_and_journals_each_job(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     directory = make_directory()
-    directory.create_user(ou_dn=OU_SUBJECT, username="petrov", first="Пётр", last="Петров")
     directory.create_user(ou_dn=OU_SUBJECT, username="sidorov", first="Сидор", last="Сидоров")
 
     jobs: list[Job] = [
@@ -99,8 +97,7 @@ def test_mixed_batch_acks_and_journals_each_job(
             last="Иванов",
             subject_key="inf-ege",
         ),
-        PromoteJob(id=2, event="promote", idempotency_key="k2", username="petrov"),
-        DeprovisionJob(id=3, event="deprovision", idempotency_key="k3", username="sidorov"),
+        DeprovisionJob(id=2, event="deprovision", idempotency_key="k2", username="sidorov"),
     ]
     lms = FakeLmsApi(jobs=jobs)
     repository = JobRepository(tmp_path / "state.db")
@@ -111,16 +108,15 @@ def test_mixed_batch_acks_and_journals_each_job(
         poller.run_once()
     repository.close()
 
-    assert [ack.id for ack in lms.acks] == [1, 2, 3]
+    assert [ack.id for ack in lms.acks] == [1, 2]
     assert all(ack.status == "done" for ack in lms.acks)
 
     rows = _rows(tmp_path / "state.db")
-    assert len(rows) == 3
+    assert len(rows) == 2
     by_job_id = {row["job_id"]: row for row in rows}
     assert by_job_id[1]["event"] == "provision"
     assert by_job_id[1]["subject_key"] == "inf-ege"
     assert by_job_id[2]["subject_key"] is None
-    assert by_job_id[3]["subject_key"] is None
     assert by_job_id[1]["received_at"] == _NOW.isoformat()
     assert by_job_id[1]["acked_at"] == _NOW.isoformat()
     assert "обработано: done" in caplog.text
@@ -131,14 +127,16 @@ def test_handler_error_is_isolated_and_batch_continues(tmp_path: Path) -> None:
     directory.create_user(ou_dn=OU_SUBJECT, username="petrov", first="Пётр", last="Петров")
 
     jobs: list[Job] = [
-        PromoteJob(id=1, event="promote", idempotency_key="k1", username="missing"),
-        PromoteJob(id=2, event="promote", idempotency_key="k2", username="petrov"),
+        DeprovisionJob(id=1, event="deprovision", idempotency_key="k1", username="missing"),
+        DeprovisionJob(id=2, event="deprovision", idempotency_key="k2", username="petrov"),
     ]
     lms = FakeLmsApi(jobs=jobs)
     repository = JobRepository(tmp_path / "state.db")
-    real_promote_handler = PromoteHandler(directory)
+    real_deprovision_handler = DeprovisionHandler(directory, ou_disabled=OU_DISABLED)
     handlers: dict[str, object] = {
-        "promote": RaisingForUsernameHandler(real_promote_handler, failing_username="missing"),
+        "deprovision": RaisingForUsernameHandler(
+            real_deprovision_handler, failing_username="missing"
+        ),
     }
     poller = make_poller(lms, repository, handlers)
 
@@ -198,7 +196,7 @@ def test_dead_threshold_logs_error_on_sixth_failure(
             JobLogEntry(
                 job_id=i,
                 idempotency_key="dead-key",
-                event="promote",
+                event="deprovision",
                 username="ghost",
                 subject_key=None,
                 status="failed",
@@ -209,10 +207,10 @@ def test_dead_threshold_logs_error_on_sixth_failure(
         )
 
     jobs: list[Job] = [
-        PromoteJob(id=6, event="promote", idempotency_key="dead-key", username="ghost"),
+        DeprovisionJob(id=6, event="deprovision", idempotency_key="dead-key", username="ghost"),
     ]
     lms = FakeLmsApi(jobs=jobs)
-    handlers: dict[str, object] = {"promote": RaisingHandler()}
+    handlers: dict[str, object] = {"deprovision": RaisingHandler()}
     poller = make_poller(lms, repository, handlers)
 
     with caplog.at_level(logging.ERROR, logger="adsync.poller"):
@@ -224,7 +222,7 @@ def test_dead_threshold_logs_error_on_sixth_failure(
 
 def test_missing_handler_for_event_fails_gracefully(tmp_path: Path) -> None:
     jobs: list[Job] = [
-        PromoteJob(id=1, event="promote", idempotency_key="k1", username="ghost"),
+        DeprovisionJob(id=1, event="deprovision", idempotency_key="k1", username="ghost"),
     ]
     lms = FakeLmsApi(jobs=jobs)
     repository = JobRepository(tmp_path / "state.db")

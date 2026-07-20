@@ -142,7 +142,7 @@ def test_daily_counts_aggregates_since_cutoff(tmp_path: Path) -> None:
         _entry(event="deprovision", status="done", acked_at=after_cutoff, idempotency_key="d1")
     )
     repo.record(
-        _entry(event="promote", status="failed", acked_at=after_cutoff, idempotency_key="f1")
+        _entry(event="deprovision", status="failed", acked_at=after_cutoff, idempotency_key="f1")
     )
     # до cutoff — не должно попасть в агрегат
     repo.record(

@@ -75,7 +75,8 @@ pydantic v2), обсудим при первом реальном расхожд
 - `class Settings(BaseSettings)` — поля по таблице Configuration CLAUDE.md, чтение из `.env`
   (`model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")`):
   - `lms_base_url: str`, `fs_lms_ad_hmac_secret: str` — обязательные, без дефолта.
-  - `jobs_poll_seconds: int = 3`, `jobs_limit: int = Field(50, ge=1, le=100)`.
+  - `jobs_poll_seconds: int = 3`, `jobs_limit: int = Field(50, ge=1, le=200)` (диапазон расширен до
+    200 позже, при сверке с `.docs/FS_LMS_API.md` — контракт fs-lms сам допускает до 200).
   - `reconcile_interval_hours: int = 6`, `reconcile_grace_minutes: int = 15`,
     `reconcile_max_disable: int = 10`, `reconcile_max_disable_pct: int = Field(20, ge=0, le=100)`.
   - `ldap_host: str = "11.11.11.11"`, `ldap_port: int = 636`,
@@ -1032,5 +1033,33 @@ uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
 ```
 
 Зависимости новые не нужны — `fastapi`/`uvicorn` уже в проекте (этап 0).
+
+---
+
+## Пост-этап 9 — удаление события `promote`
+
+При подготовке `.docs/basic_doc.md`/`.docs/AdSync_API.md` и сверке с нормативными документами
+модуля `Inc\Modules\AdSync` (`.docs/FS_LMS_API.md` §3.1 и — что важнее — оригинал
+`AdSyncPythonService.md` в самом репозитории плагина `fs-lms`) подтвердилось: событие `promote`
+**не существует** в контракте WP и никогда не отдаётся. На этапах 1/5/6 выше `PromoteJob`/
+`PromoteHandler` были реализованы как задел на случай появления такого события в будущем — этот
+задел убран целиком:
+
+- `src/models.py` — `PromoteJob` удалён из discriminated union `Job` (остались `ProvisionJob |
+  DeprovisionJob`).
+- `src/handlers.py` — класс `PromoteHandler` удалён.
+- `src/main.py` — строка `"promote": PromoteHandler(...)` убрана из реестра обработчиков.
+- Тесты: `TestPromoteHandler` (`test_handlers.py`), `test_promote_job_parses_from_raw_payload`
+  (`test_models.py`), promote-ветка в `test_get_jobs_signs_empty_body_and_parses_mixed_jobs`
+  (`test_lms.py`) — удалены; в `test_poller.py` четыре теста, использовавшие `PromoteJob`/
+  `PromoteHandler` как удобную заглушку для сценариев (изоляция ошибок, dead-порог, отсутствие
+  обработчика), переписаны на `DeprovisionJob`/`DeprovisionHandler` без потери покрытия сценария.
+- Заодно расширен `JOBS_LIMIT`: `Field(default=50, ge=1, le=100)` → `le=200` — контракт fs-lms сам
+  допускает `limit` до 200 (`.docs/FS_LMS_API.md` §3.1), прежнее `le=100` было ничем не
+  обосновано у́же.
+
+Все упоминания `promote` в разбивках этапов 1/5/6 выше — исторический след (что было реально
+спланировано и построено в момент написания), не трогаются задним числом. Актуальное состояние —
+`.docs/CLAUDE.md` (раздел «События → действия в AD») и `.docs/AdSync_API.md`.
 
 ---

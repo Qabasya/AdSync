@@ -11,7 +11,7 @@ import httpx
 import pytest
 
 from lms import LmsClient
-from models import AckRequest, DeprovisionJob, PromoteJob, ProvisionJob
+from models import AckRequest, DeprovisionJob, ProvisionJob
 
 SECRET = "test-secret"
 BASE_URL = "https://example.com/wp-json/fs-lms/v1"
@@ -49,12 +49,6 @@ def test_get_jobs_signs_empty_body_and_parses_mixed_jobs() -> None:
                         "idempotency_key": "deprovision:app:9",
                         "username": "a.sidorov",
                     },
-                    {
-                        "id": 9,
-                        "event": "promote",
-                        "idempotency_key": "promote:person:3",
-                        "username": "p.orlov",
-                    },
                 ]
             },
         )
@@ -69,7 +63,6 @@ def test_get_jobs_signs_empty_body_and_parses_mixed_jobs() -> None:
 
     assert isinstance(jobs[0], ProvisionJob)
     assert isinstance(jobs[1], DeprovisionJob)
-    assert isinstance(jobs[2], PromoteJob)
 
 
 def test_ack_signs_actual_body_bytes_and_omits_none_error() -> None:
