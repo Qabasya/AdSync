@@ -35,6 +35,7 @@ def test_settings_loads_from_env_with_defaults(monkeypatch: pytest.MonkeyPatch) 
     assert settings.data_dir == Path("/data")
     assert settings.api_port == 8091
     assert settings.loki_url is None
+    assert settings.heartbeat_interval_seconds == 3600
 
 
 def test_settings_overrides_defaults_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -46,6 +47,14 @@ def test_settings_overrides_defaults_from_env(monkeypatch: pytest.MonkeyPatch) -
 
     assert settings.jobs_poll_seconds == 5
     assert settings.api_port == 9000
+
+
+def test_settings_rejects_non_positive_heartbeat_interval(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("HEARTBEAT_INTERVAL_SECONDS", "0")
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)  # type: ignore[call-arg]
 
 
 def test_settings_missing_required_variable_raises(monkeypatch: pytest.MonkeyPatch) -> None:

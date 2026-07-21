@@ -1092,3 +1092,46 @@ uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
   включённой».
 
 ---
+
+## Пост-этап 9 — heartbeat-лог, синхронизация с fs-video-uploader
+
+По запросу из соседнего репозитория (`fs-video-uploader`, тот же общий Loki/Grafana): нужен единый
+для обеих служб способ понять «сервис вообще жив» на дашборде — редкий, но регулярный сигнал,
+независимый от того, есть ли реальная активность (задания/видео) в моменте.
+
+Старт/стоп-логи (`fs-adsync запускается`/`остановлен`) и семантика уровней (INFO/WARNING/ERROR) в
+этом сервисе уже были в порядке — правки не потребовалось. Не хватало только heartbeat: кандидат
+(`logger.info("получено %d заданий от LMS", ...)` в `poller.run_once`) был осознанно закомментирован
+чуть раньше (коммит `ebc1bbb`) — шумел на каждые `JOBS_POLL_SECONDS` (3 с по умолчанию) даже при
+нулевой активности. Heartbeat — не реинкарнация этого лога, а отдельный редкий
+(`HEARTBEAT_INTERVAL_SECONDS`, default 3600) INFO-лог с агрегатами из уже существующего
+`JobRepository.status_counts()`.
+
+**Важно:** новых Loki-лейблов не заводили — сознательно, по действующему решению этого же файла
+(раздел Logging & Notifications: только `service`/`level`, низкая кардинальность). Дашборд по
+`fs-video-uploader`/`fs-adsync` строится на уровне (`level="error"` → алерт) и тексте строки
+(`count_over_time` + `|=` по подстроке), не на новых лейблах.
+
+- `src/config.py` — `heartbeat_interval_seconds: int = Field(default=3600, ge=1)`.
+- `src/main.py` — `run_heartbeat_tick()` (замыкание, как `run_jobs_tick`/`run_reconcile_tick`),
+  третий демон-поток `heartbeat` через тот же `_loop()`, что у `jobs`/`reconcile` — значит и то же
+  поведение: первый heartbeat срабатывает только после первого полного интервала, не сразу при
+  старте (по докстрингу `_loop`, тик — после `stop.wait(interval)`, не до). Лог: `fs-adsync жив:
+  done=%d, failed=%d, dead=%d`.
+- `.env.example`, `.docs/CLAUDE.md` (таблица Configuration + раздел Logging & Notifications) —
+  `HEARTBEAT_INTERVAL_SECONDS`; заодно поправлена устаревшая ссылка `fs-video-ingest` →
+  `fs-video-uploader` (переименование произошло в том репозитории 2026-07-16, здесь не подхватили).
+- `tests/test_config.py` — дефолт `heartbeat_interval_seconds`, отклонение `<= 0`.
+- `run_heartbeat_tick`/`run_jobs_tick`/`run_reconcile_tick` — тонкие замыкания внутри `main()`, как
+  и раньше не покрыты юнит-тестами напрямую (сам `main()` не тестируется без реального
+  LDAPS/uvicorn — см. `test_main.py`); используемая ими логика (`JobRepository.status_counts()`)
+  уже покрыта `test_repository.py`.
+
+**Definition of Done:**
+
+- `uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest` — чисто, 89/89.
+- Реализовано Claude по прямому запросу пользователя (сравнение и синхронизация логов с
+  fs-video-uploader), без цикла постановка → пишете сами — тот же формат работы, что в
+  fs-video-uploader с 2026-07-16 (Claude пишет по прямой просьбе, не по умолчанию).
+
+---

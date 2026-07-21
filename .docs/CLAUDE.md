@@ -182,13 +182,22 @@ subjects:
 
 Единый канал: всё, что происходит в сервисе — успешные операции, предупреждения, ошибки —
 проходит через стандартный `logging`. Отдельного слоя бизнес-уведомлений в коде сервиса нет.
-Оба сервиса инфраструктуры (этот и fs-video-ingest) пишут в общий Loki; если понадобится
+Оба сервиса инфраструктуры (этот и fs-video-uploader) пишут в общий Loki; если понадобится
 оповещение в мессенджер — это Grafana Alerting поверх Loki (LogQL-правило + contact point),
 настраивается руками в Grafana, не в этом репозитории.
 
 - Только stdlib `logging`; хендлеры собирает `logging_setup.py`:
   - file — `RotatingFileHandler` `DATA_DIR/logs/adsync.log` (10 MiB × 5), всегда включён;
-  - loki — HTTP push (`/loki/api/v1/push`) при заданном `LOKI_URL`. **Loki общий для всей инфраструктуры** (тот же контейнер, что у fs-video-ingest); лейблы потока только низкокардинальные: `service="fs-adsync"`, `level`. `username`/`idempotency_key` — в тексте строки, не в лейблах.
+  - loki — HTTP push (`/loki/api/v1/push`) при заданном `LOKI_URL`. **Loki общий для всей инфраструктуры** (тот же контейнер, что у fs-video-uploader); лейблы потока только низкокардинальные: `service="fs-adsync"`, `level`. `username`/`idempotency_key` — в тексте строки, не в лейблах.
+- **Старт/стоп**: `fs-adsync запускается` (`main.py`, сразу после `configure_logging`) / `fs-adsync
+  остановлен` (в конце `main()`, после закрытия всех клиентов) — единообразно с fs-video-uploader.
+- **Heartbeat**: раз в `HEARTBEAT_INTERVAL_SECONDS` (default `3600`) — `fs-adsync жив: done=N,
+  failed=N, dead=N` (сводка `JobRepository.status_counts()`), отдельный демон-поток `heartbeat` по
+  тому же идиому `_loop()`, что у `jobs`/`reconcile` (первый heartbeat ждёт полный интервал, как и
+  первый тик остальных циклов — не срабатывает мгновенно при старте). Не привязан к
+  `JOBS_POLL_SECONDS` намеренно — по этой же причине из него в своё время убрали лог числа заданий
+  за тик (шумит на каждые 3 секунды даже без единого задания); heartbeat — редкий и всегда содержит
+  осмысленные агрегаты, а не «X заданий, ноль».
 - **Redaction-фильтр** (`logging.Filter`): значения полей `password`/`unicodePwd` вырезаются из любых записей до форматирования.
 - Уровни осознанно расставлены по всему коду:
   - INFO — успешные операции: создание/реактивация учётки, `deprovision` → `done`,
@@ -228,7 +237,8 @@ subjects:
 | `TZ_NAME` | `Europe/Moscow` | Время сводки и grace-расчётов |
 | `DAILY_SUMMARY_TIME` | — | `HH:MM` дневной сводки (пусто = выкл) |
 | `LOKI_URL` | — | Опция |
-| `API_PORT` | `8091` | FastAPI (8090 занят fs-video-ingest — не путать) |
+| `HEARTBEAT_INTERVAL_SECONDS` | `3600` | Период лога «adsync жив» (сводка `JobRepository.status_counts()`) |
+| `API_PORT` | `8091` | FastAPI (8090 занят fs-video-uploader — не путать) |
 
 ## HTTP API
 

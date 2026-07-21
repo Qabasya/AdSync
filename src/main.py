@@ -1,5 +1,5 @@
-"""Composition root: `Settings` → зависимости → два daemon-потока + опциональный поток дневной
-сводки + `uvicorn` с локальным API. Graceful shutdown по SIGTERM/SIGINT.
+"""Composition root: `Settings` → зависимости → три daemon-потока (jobs/reconcile/heartbeat) +
+опциональный поток дневной сводки + `uvicorn` с локальным API. Graceful shutdown по SIGTERM/SIGINT.
 """
 
 import logging
@@ -156,6 +156,12 @@ def main() -> None:
             state.last_reconcile_at = _now()
             return result
 
+    def run_heartbeat_tick() -> None:
+        counts = repository.status_counts()
+        logger.info(
+            "fs-adsync жив: done=%d, failed=%d, dead=%d", counts.done, counts.failed, counts.dead
+        )
+
     threads = [
         threading.Thread(
             target=_loop,
@@ -167,6 +173,12 @@ def main() -> None:
             target=_loop,
             args=(stop, settings.reconcile_interval_hours * 3600, run_reconcile_tick, "сверки"),
             name="reconcile",
+            daemon=True,
+        ),
+        threading.Thread(
+            target=_loop,
+            args=(stop, settings.heartbeat_interval_seconds, run_heartbeat_tick, "heartbeat"),
+            name="heartbeat",
             daemon=True,
         ),
     ]
