@@ -65,6 +65,14 @@ def test_find_user_returns_dn_and_enabled_state() -> None:
 
     assert user is not None
     assert user.dn == dn
+    # create_user создаёт отключённой — AD требует заданный пароль до включения (WILL_NOT_PERFORM).
+    assert user.enabled is False
+
+    gateway.ensure_password(dn, "NewPass123")
+    gateway.ensure_enabled(dn)
+    user = gateway.find_user("i.petrov")
+
+    assert user is not None
     assert user.enabled is True
 
 

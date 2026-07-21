@@ -113,7 +113,11 @@ class DirectoryGateway(Protocol):
         ...
 
     def create_user(self, *, ou_dn: str, username: str, first: str, last: str) -> str:
-        """Создаёт включённую учётку в `ou_dn`. Идемпотентно. Возвращает DN. Без пароля."""
+        """Создаёт учётку в `ou_dn`, изначально ОТКЛЮЧЁННОЙ. Идемпотентно. Возвращает DN.
+
+        AD отклоняет создание сразу включённой учётки без пароля (`WILL_NOT_PERFORM`/5003) — пароль
+        и включение это отдельные последующие шаги (`ensure_password`, затем `ensure_enabled`).
+        """
         ...
 
     def ensure_password(self, dn: str, password: str) -> None:
@@ -231,7 +235,9 @@ class AdGateway:
             "givenName": first,
             "sn": last,
             "displayName": display_name,
-            "userAccountControl": _ACCOUNT_ENABLED,
+            # Создаём ОТКЛЮЧЁННОЙ: AD отклоняет add() сразу включённой учётки без пароля
+            # (WILL_NOT_PERFORM/5003). Включение — отдельным шагом, после ensure_password.
+            "userAccountControl": _ACCOUNT_DISABLED,
         }
 
         def op() -> bool:

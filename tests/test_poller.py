@@ -84,7 +84,10 @@ def test_mixed_batch_acks_and_journals_each_job(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     directory = make_directory()
-    directory.create_user(ou_dn=OU_SUBJECT, username="sidorov", first="Сидор", last="Сидоров")
+    sidorov_dn = directory.create_user(
+        ou_dn=OU_SUBJECT, username="sidorov", first="Сидор", last="Сидоров"
+    )
+    directory.ensure_enabled(sidorov_dn)
 
     jobs: list[Job] = [
         ProvisionJob(
@@ -124,7 +127,10 @@ def test_mixed_batch_acks_and_journals_each_job(
 
 def test_handler_error_is_isolated_and_batch_continues(tmp_path: Path) -> None:
     directory = make_directory()
-    directory.create_user(ou_dn=OU_SUBJECT, username="petrov", first="Пётр", last="Петров")
+    petrov_dn = directory.create_user(
+        ou_dn=OU_SUBJECT, username="petrov", first="Пётр", last="Петров"
+    )
+    directory.ensure_enabled(petrov_dn)
 
     jobs: list[Job] = [
         DeprovisionJob(id=1, event="deprovision", idempotency_key="k1", username="missing"),

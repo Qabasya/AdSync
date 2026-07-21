@@ -118,7 +118,7 @@ SOLID здесь — про границы, а не про количество 
 
 | `event` | payload | Действие |
 |---|---|---|
-| `provision` | `id, event, idempotency_key, username, password, first, last, subject_key` | Создать учётку в OU направления по `subjects.yaml`: `objectClass=user`, `sAMAccountName=username`, `userPrincipalName={username}@{AD_UPN_SUFFIX}`, `cn`/`displayName` из `first`+`last`, включена сразу (`userAccountControl=512`); пароль `unicodePwd` только по LDAPS через `extend.microsoft.modify_password`; `MODIFY_ADD` в security-группу направления |
+| `provision` | `id, event, idempotency_key, username, password, first, last, subject_key` | Создать учётку в OU направления по `subjects.yaml`: `objectClass=user`, `sAMAccountName=username`, `userPrincipalName={username}@{AD_UPN_SUFFIX}`, `cn`/`displayName` из `first`+`last`; создаётся **отключённой** (`userAccountControl=514`) — AD отклоняет `add()` сразу включённой учётки без пароля (`WILL_NOT_PERFORM`/5003); пароль `unicodePwd` только по LDAPS через `extend.microsoft.modify_password`, и только **после** этого — включение (`userAccountControl=512`); `MODIFY_ADD` в security-группу направления |
 | `deprovision` | `id, event, idempotency_key, username` | `userAccountControl=514` + `modify_dn` в `AD_OU_DISABLED` |
 
 Событий ровно два — никакой промежуточной стадии «зачислен» в OU-структуре нет: учётка создаётся

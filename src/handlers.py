@@ -66,7 +66,10 @@ class ProvisionHandler:
             dn = self._directory.create_user(
                 ou_dn=target_ou, username=job.username, first=job.first, last=job.last
             )
+            # create_user создаёт отключённой (у AD без пароля включить нельзя — WILL_NOT_PERFORM);
+            # включаем только после того, как пароль реально задан.
             self._directory.ensure_password(dn, job.password)
+            self._directory.ensure_enabled(dn)
             if target_group is not None:
                 self._directory.ensure_group_membership(dn, target_group)
             logger.info("создана учётка %s в %s", job.username, target_ou)

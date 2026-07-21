@@ -76,7 +76,9 @@ class FakeDirectoryGateway:
         created_at: datetime | None = None,
     ) -> str:
         dn = f"CN={first} {last},{ou_dn}"
-        self.users_by_username[username] = DirectoryUser(dn=dn, enabled=True)
+        # Как и настоящий AdGateway: создаём ОТКЛЮЧЁННОЙ — AD не даёт включить учётку без пароля
+        # (WILL_NOT_PERFORM). Включение — отдельный вызов ensure_enabled после ensure_password.
+        self.users_by_username[username] = DirectoryUser(dn=dn, enabled=False)
         self.created_at[username] = created_at or _DEFAULT_CREATED_AT
         return dn
 

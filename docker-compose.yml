@@ -21,3 +21,5 @@ services:
       timeout: 5s
       start_period: 15s
       retries: 3
+    extra_hosts:
+      - "dc.fs.loc:11.11.11.11"
