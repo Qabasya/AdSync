@@ -8,6 +8,7 @@ import logging
 from pathlib import Path
 
 import httpx
+import pytest
 
 from logging_setup import LokiHandler, RedactionFilter, configure_logging
 
@@ -57,6 +58,33 @@ class TestLokiHandler:
         stream = payload["streams"][0]
         assert stream["stream"] == {"service": "fs-adsync", "level": "warning"}
         assert stream["values"][0][1] == "тестовая запись"
+
+    def test_emit_after_close_self_heals_and_delivers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Клиент, закрытый (не обязательно явным close() этого хендлера — см. разбор в
+        fs-video-uploader, тот же Loki), не должен ронять доставку до конца жизни процесса —
+        хендлер обязан пересобрать клиент и всё же отправить запись."""
+        captured: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            return httpx.Response(204)
+
+        loki_handler = LokiHandler("http://loki.local", transport=httpx.MockTransport(handler))
+        loki_handler.setFormatter(logging.Formatter("%(message)s"))
+        loki_handler.close()
+        assert loki_handler._client.is_closed
+
+        calls: list[logging.LogRecord] = []
+        monkeypatch.setattr(loki_handler, "handleError", calls.append)
+
+        record = _make_record("после закрытия")
+        loki_handler.emit(record)
+
+        assert calls == []
+        assert len(captured) == 1
+        assert not loki_handler._client.is_closed
 
     def test_transport_failure_does_not_raise(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:

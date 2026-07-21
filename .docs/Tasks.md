@@ -1135,3 +1135,25 @@ uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
   fs-video-uploader с 2026-07-16 (Claude пишет по прямой просьбе, не по умолчанию).
 
 ---
+
+## Пост-этап 9 — `LokiHandler` пересобирает клиент сам (синхронизация с fs-video-uploader)
+
+На fs-video-uploader обнаружен и разобран баг: `httpx.Client` у `LokiHandler` иногда оказывался
+закрытым (`RuntimeError: Cannot send a request, as the client has been closed.`) посреди обычной
+работы, не только при штатном shutdown — расследование указало на архитектурное отличие: там
+`uvicorn.run()` вызывался в главном потоке (uvicorn сам ставил `signal.signal()` на SIGTERM/SIGINT
+параллельно собственному graceful shutdown сервиса), тогда как здесь uvicorn и так поднимается в
+отдельном daemon-потоке через `uvicorn.Server(...).run()`, а сигналами управляет только наш
+`handle_signal()` — то есть у fs-adsync этой конкретной причины конфликта нет и не было (архитектуру
+здесь менять не потребовалось).
+
+Тем не менее добавлено то же самовосстановление в `LokiHandler.emit()` — дёшево, а полная потеря
+доставки в Loki до конца жизни процесса (если когда-нибудь всё же случится по другой причине) хуже
+пересборки клиента "на лету":
+
+- `src/logging_setup.py` — `_build_client()`, проверка `self._client.is_closed` в начале `emit()`.
+- `tests/test_logging_setup.py` — новый `test_emit_after_close_self_heals_and_delivers`.
+
+**Definition of Done:** `uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest` — чисто, 90/90. Реализовано по прямому запросу пользователя.
+
+---
