@@ -87,7 +87,19 @@ class TestProvisionHandler:
         assert directory.users_by_username["ivanov"].dn == dn
         assert directory.passwords[dn] == "new-pass"
         assert dn in directory.group_members[GROUP_SUBJECT]
-        assert "ivanov" in caplog.text
+
+    def test_existing_user_in_zone_but_still_disabled_gets_enabled(self) -> None:
+        # Регрессия: если предыдущая попытка упала между ensure_password и ensure_enabled (см.
+        # новую учётку), повторная выдача задания находит учётку уже в зоне направления, но ещё
+        # отключённой — эта ветка обязана сама включить её, а не просто обновить пароль/группу.
+        directory = make_directory()
+        directory.create_user(ou_dn=OU_SUBJECT, username="ivanov", first="Иван", last="Иванов")
+        handler = ProvisionHandler(directory, subjects=SUBJECTS, ou_fallback=OU_FALLBACK)
+
+        result = handler.handle(provision_job())
+
+        assert result.status == "done"
+        assert directory.users_by_username["ivanov"].enabled is True
 
     def test_existing_user_in_disabled_ou_is_reactivated(
         self, caplog: pytest.LogCaptureFixture

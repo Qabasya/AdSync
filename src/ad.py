@@ -226,6 +226,16 @@ class AdGateway:
         uac = int(entries[0]["userAccountControl"].value)
         return DirectoryUser(dn=entries[0].entry_dn, enabled=not bool(uac & _ACCOUNTDISABLE_BIT))
 
+    def _log_result(self, action: str, dn: str) -> None:
+        result = self._connection.result
+        logger.info(
+            "%s: %s — LDAP result=%s (%s)",
+            action,
+            dn,
+            result.get("result"),
+            result.get("description"),
+        )
+
     def create_user(self, *, ou_dn: str, username: str, first: str, last: str) -> str:
         display_name = f"{first} {last}"
         dn = f"CN={escape_rdn(display_name)},{ou_dn}"
@@ -245,8 +255,9 @@ class AdGateway:
 
         try:
             self._run(op)
+            self._log_result("создана учётная запись (отключена)", dn)
         except LDAPEntryAlreadyExistsResult:
-            logger.info("Учётная запись %s уже существует, создание пропущено", dn)
+            logger.info("учётная запись уже существует, создание пропущено: %s", dn)
         return dn
 
     def ensure_password(self, dn: str, password: str) -> None:
@@ -258,14 +269,15 @@ class AdGateway:
             return bool(result)
 
         self._run(op)
+        self._log_result("пароль установлен", dn)
 
     def ensure_enabled(self, dn: str) -> None:
-        self._set_account_control(dn, _ACCOUNT_ENABLED)
+        self._set_account_control(dn, _ACCOUNT_ENABLED, action="учётная запись включена")
 
     def ensure_disabled(self, dn: str) -> None:
-        self._set_account_control(dn, _ACCOUNT_DISABLED)
+        self._set_account_control(dn, _ACCOUNT_DISABLED, action="учётная запись отключена")
 
-    def _set_account_control(self, dn: str, value: int) -> None:
+    def _set_account_control(self, dn: str, value: int, *, action: str) -> None:
         if not self.is_in_managed_zone(dn):
             raise OutsideManagedZoneError(dn)
 
@@ -275,6 +287,7 @@ class AdGateway:
             )
 
         self._run(op)
+        self._log_result(action, dn)
 
     def ensure_group_membership(self, user_dn: str, group_dn: str) -> None:
         if not self.is_in_managed_zone(user_dn):
@@ -289,17 +302,20 @@ class AdGateway:
         entries = self._connection.entries
         members = list(entries[0]["member"].values) if entries else []
         if any(_dn_equals(member, user_dn) for member in members):
+            logger.info("уже состоит в группе %s: %s", group_dn, user_dn)
             return
 
         def modify_op() -> bool:
             return bool(self._connection.modify(group_dn, {"member": [(MODIFY_ADD, [user_dn])]}))
 
         self._run(modify_op)
+        self._log_result(f"добавлена в группу {group_dn}", user_dn)
 
     def move_to_ou(self, dn: str, target_ou_dn: str) -> str:
         if not self.is_in_managed_zone(dn):
             raise OutsideManagedZoneError(dn)
         if _dn_equals(_parent_ou(dn), target_ou_dn):
+            logger.info("уже в целевой OU %s: %s", target_ou_dn, dn)
             return dn
 
         rdn_attr, rdn_value, _ = parse_dn(dn)[0]
@@ -309,7 +325,9 @@ class AdGateway:
             return bool(self._connection.modify_dn(dn, new_rdn, new_superior=target_ou_dn))
 
         self._run(op)
-        return f"{new_rdn},{target_ou_dn}"
+        new_dn = f"{new_rdn},{target_ou_dn}"
+        self._log_result(f"перенесена в {target_ou_dn}", new_dn)
+        return new_dn
 
     def verify_zone_exists(self) -> None:
         missing = [dn for dn in self._config_dns if not self._dn_exists(dn)]

@@ -1,5 +1,6 @@
 """Тесты `AdGateway` (`ad.py`) на `ldap3` `MOCK_SYNC` — без сети, без реального AD."""
 
+import logging
 from datetime import UTC, datetime
 
 import pytest
@@ -87,6 +88,20 @@ def test_ensure_password_does_not_raise() -> None:
     gateway = _make_gateway()
     dn = gateway.create_user(ou_dn=SUBJECT_OU, username="i.petrov", first="Иван", last="Петров")
     gateway.ensure_password(dn, "NewPass123")
+
+
+def test_each_step_logs_ldap_result(caplog: pytest.LogCaptureFixture) -> None:
+    gateway = _make_gateway()
+
+    with caplog.at_level(logging.INFO, logger="adsync.ad"):
+        dn = gateway.create_user(ou_dn=SUBJECT_OU, username="i.petrov", first="Иван", last="Петров")
+        gateway.ensure_password(dn, "NewPass123")
+        gateway.ensure_enabled(dn)
+
+    assert "создана учётная запись (отключена)" in caplog.text
+    assert "пароль установлен" in caplog.text
+    assert "учётная запись включена" in caplog.text
+    assert "LDAP result=" in caplog.text
 
 
 def test_ensure_enabled_and_disabled_toggle_state() -> None:

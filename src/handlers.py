@@ -86,6 +86,10 @@ class ProvisionHandler:
 
         if self._directory.is_in_managed_zone(existing.dn):
             self._directory.ensure_password(existing.dn, job.password)
+            # На случай, если предыдущая попытка упала между паролем и включением (см. ветку
+            # выше) — без этого учётка так и осталась бы отключённой на все последующие ретраи,
+            # т.к. эта ветка «уже существует в зоне» иначе состояние enabled не трогает.
+            self._directory.ensure_enabled(existing.dn)
             if target_group is not None:
                 self._directory.ensure_group_membership(existing.dn, target_group)
             logger.info("обновлена учётка %s в зоне", job.username)
