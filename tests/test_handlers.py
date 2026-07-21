@@ -5,6 +5,7 @@ import logging
 import pytest
 from fakes import FakeDirectoryGateway
 
+from ad import DirectoryUser
 from config import SubjectConfig
 from handlers import DeprovisionHandler, ProvisionHandler
 from models import DeprovisionJob, ProvisionJob
@@ -52,6 +53,9 @@ class TestProvisionHandler:
         assert user.dn.endswith(OU_SUBJECT)
         assert directory.passwords[user.dn] == "s3cret"
         assert user.dn in directory.group_members[GROUP_SUBJECT]
+        # create_user создаёт отключённой (AD не даёт включить без пароля) — обработчик обязан
+        # включить учётку сам, после того как пароль задан.
+        assert user.enabled is True
         assert "ivanov" in caplog.text
 
     def test_new_user_unknown_subject(self, caplog: pytest.LogCaptureFixture) -> None:
@@ -65,6 +69,7 @@ class TestProvisionHandler:
         user = directory.users_by_username["ivanov"]
         assert user.dn.endswith(OU_FALLBACK)
         assert directory.group_members == {}
+        assert user.enabled is True
         assert "unknown-subject" in caplog.text
 
     def test_existing_user_in_zone_updates_password_and_group(
@@ -72,6 +77,7 @@ class TestProvisionHandler:
     ) -> None:
         directory = make_directory()
         dn = directory.create_user(ou_dn=OU_SUBJECT, username="ivanov", first="Иван", last="Иванов")
+        directory.ensure_enabled(dn)
         handler = ProvisionHandler(directory, subjects=SUBJECTS, ou_fallback=OU_FALLBACK)
 
         with caplog.at_level(logging.INFO, logger="adsync.handlers"):
@@ -156,7 +162,8 @@ class TestDeprovisionHandler:
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         directory = make_directory()
-        directory.create_user(ou_dn=OU_SUBJECT, username="ivanov", first="Иван", last="Иванов")
+        dn = directory.create_user(ou_dn=OU_SUBJECT, username="ivanov", first="Иван", last="Иванов")
+        directory.ensure_enabled(dn)
         handler = DeprovisionHandler(directory, ou_disabled=OU_DISABLED)
 
         with caplog.at_level(logging.INFO, logger="adsync.handlers"):
@@ -184,6 +191,10 @@ class TestDeprovisionHandler:
     def test_user_outside_zone_fails_without_touching(self) -> None:
         directory = make_directory()
         dn = directory.create_user(ou_dn=OU_OUTSIDE, username="ivanov", first="Иван", last="Иванов")
+        # Вне зоны ensure_enabled недоступен (guard) — учётка чужая, могла быть включена кем угодно;
+        # сеем состояние напрямую, минуя create_user, который по умолчанию создаёт отключённой.
+        directory.users_by_username["ivanov"] = DirectoryUser(dn=dn, enabled=True)
+
         handler = DeprovisionHandler(directory, ou_disabled=OU_DISABLED)
 
         result = handler.handle(deprovision_job())

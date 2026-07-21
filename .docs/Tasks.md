@@ -1063,3 +1063,32 @@ uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
 `.docs/CLAUDE.md` (раздел «События → действия в AD») и `.docs/AdSync_API.md`.
 
 ---
+
+## Пост-этап 9 — баг: `WILL_NOT_PERFORM` (5003) при создании учётки
+
+На живом домене `provision` для новой учётки падал с `0000052D: SvcErr: DSID-031A12C5, problem
+5003 (WILL_NOT_PERFORM)`. Причина: `AdGateway.create_user` (этап 4) создавал учётку сразу
+**включённой** (`userAccountControl=512`) без пароля — AD отклоняет такой `add()` целиком, пароль
+обязан быть задан до включения. `MOCK_SYNC` в `test_ad.py` этот бизнес-констрейнт не проверяет
+(это mock, не полноценная эмуляция схемы AD), поэтому баг не был пойман на этапе 4/5.
+
+Исправление:
+- `src/ad.py` — `create_user` создаёт учётку **отключённой** (`userAccountControl=514`);
+  `DirectoryGateway.create_user` docstring обновлён с объяснением константы.
+- `src/handlers.py` — `ProvisionHandler.handle`, ветка новой учётки: `ensure_enabled(dn)`
+  добавлен **после** `ensure_password(dn, job.password)` (порядок важен — включать до задания
+  пароля нельзя по той же причине).
+- `tests/fakes.py` — `FakeDirectoryGateway.create_user` теперь тоже сеет `enabled=False` (раньше
+  сразу `True` — фейк был точно так же «слишком добрым» и не смог бы поймать этот класс багов).
+  Все места в `tests/test_reconcile.py`/`test_poller.py`/`test_handlers.py`, где `create_user`
+  использовался просто как способ посеять «уже активную» учётку под сценарий, не относящийся к
+  провижну (сверка, deprovision, изоляция ошибок в поллере), донастроены явным `ensure_enabled(dn)`
+  сразу после посева (в `test_reconcile.py` — через хелпер `seed_active_account`).
+- `tests/test_handlers.py` — в тесты создания новой учётки (`test_new_user_known_subject`,
+  `test_new_user_unknown_subject`) добавлен явный `assert user.enabled is True` — это и есть
+  регрессионная защита именно от этого класса багов на будущее.
+- `.docs/CLAUDE.md` — таблица «События → действия в AD», строка `provision`, переформулирована:
+  явно описана последовательность «создать отключённой → пароль → включить», а не «создать сразу
+  включённой».
+
+---
