@@ -54,7 +54,7 @@ class Poller:
             logger.exception("не удалось получить задания с LMS")
             return
 
-        logger.info("получено %d заданий от LMS", len(jobs))
+        # logger.info("получено %d заданий от LMS", len(jobs))
         for job in jobs:
             self._process(job, received_at)
 
