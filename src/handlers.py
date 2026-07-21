@@ -95,7 +95,9 @@ class ProvisionHandler:
             logger.info("обновлена учётка %s в зоне", job.username)
             return HandlerResult("done")
 
-        logger.error("Учётная запись %s вне управляемой зоны, объект не тронут", job.username)
+        logger.error(
+            "provision %s: учётная запись вне управляемой зоны, объект не тронут", job.username
+        )
         return HandlerResult("failed", error="учётная запись вне управляемой зоны")
 
 
@@ -115,7 +117,10 @@ class DeprovisionHandler:
             return HandlerResult("done")
 
         if not self._directory.is_in_managed_zone(user.dn):
-            logger.error("Учётная запись %s вне управляемой зоны, объект не тронут", job.username)
+            logger.error(
+                "deprovision %s: учётная запись вне управляемой зоны, объект не тронут",
+                job.username,
+            )
             return HandlerResult("failed", error="учётная запись вне управляемой зоны")
 
         if not user.enabled:

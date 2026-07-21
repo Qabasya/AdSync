@@ -5,6 +5,7 @@
 по модели — этот API только для админа/healthcheck.
 """
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -14,6 +15,8 @@ from pydantic import BaseModel
 
 from reconcile import ReconcileResult
 from repository import JobRepository
+
+logger = logging.getLogger("adsync.api")
 
 
 @dataclass
@@ -110,6 +113,7 @@ def create_api(
 
     @app.post("/reconcile")
     def trigger_reconcile() -> ReconcileResponse:
+        logger.info("внеочередная сверка запущена через POST /reconcile")
         result = run_reconcile()
         return ReconcileResponse(
             aborted=result.aborted,

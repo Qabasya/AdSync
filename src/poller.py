@@ -62,6 +62,7 @@ class Poller:
         logger.info("обрабатываю задание %s (%s) для %s", job.id, job.event, job.username)
         handler = self._handlers.get(job.event)
         if handler is None:
+            logger.error("нет обработчика для события %r у задания %s", job.event, job.id)
             result = HandlerResult("failed", error=f"нет обработчика для события {job.event!r}")
         else:
             result = self._run_handler(handler, job)
