@@ -45,11 +45,22 @@ class LokiHandler(logging.Handler):
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         super().__init__()
+        self._loki_url = loki_url
         self._service = service
-        self._client = httpx.Client(base_url=loki_url, timeout=5.0, transport=transport)
+        self._transport = transport
+        self._client = self._build_client()
+
+    def _build_client(self) -> httpx.Client:
+        return httpx.Client(base_url=self._loki_url, timeout=5.0, transport=self._transport)
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
+            if self._client.is_closed:
+                # Наблюдалось на fs-video-uploader (том же Loki): клиент оказывался
+                # закрытым не через явный close() этого хендлера — источник не
+                # локализован, но тихая потеря ВСЕЙ доставки до конца жизни процесса
+                # хуже пересборки клиента "на лету".
+                self._client = self._build_client()
             line = self.format(record)
             timestamp_ns = str(int(record.created * 1_000_000_000))
             payload = {
