@@ -88,5 +88,6 @@ class Settings(BaseSettings):
     daily_summary_time: str | None = None
 
     loki_url: str | None = None
+    heartbeat_interval_seconds: int = Field(default=3600, ge=1)
 
     api_port: int = 8091
