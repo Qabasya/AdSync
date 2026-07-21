@@ -14,7 +14,10 @@ import httpx
 
 _MAX_LOG_BYTES = 10 * 1024 * 1024
 _LOG_BACKUP_COUNT = 5
-_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+_FILE_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+# Без времени: Loki сам хранит и показывает время записи (мы передаём record.created в
+# timestamp_ns при push) — свой asctime в тексте строки был бы дублем той же метки в Grafana.
+_LOKI_LOG_FORMAT = "%(levelname)s %(name)s: %(message)s"
 
 _SENSITIVE_PATTERN = re.compile(r"(?i)(password|unicodePwd)=(?:'[^']*'|\"[^\"]*\"|\S+)")
 
@@ -85,19 +88,18 @@ def configure_logging(
     logger.propagate = False
 
     redaction_filter = RedactionFilter()
-    formatter = logging.Formatter(_LOG_FORMAT)
 
     log_path = data_dir / "logs" / "adsync.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     file_handler = RotatingFileHandler(
         log_path, maxBytes=_MAX_LOG_BYTES, backupCount=_LOG_BACKUP_COUNT, encoding="utf-8"
     )
-    file_handler.setFormatter(formatter)
+    file_handler.setFormatter(logging.Formatter(_FILE_LOG_FORMAT))
     file_handler.addFilter(redaction_filter)
     logger.addHandler(file_handler)
 
     if loki_url:
         loki_handler = LokiHandler(loki_url)
-        loki_handler.setFormatter(formatter)
+        loki_handler.setFormatter(logging.Formatter(_LOKI_LOG_FORMAT))
         loki_handler.addFilter(redaction_filter)
         logger.addHandler(loki_handler)

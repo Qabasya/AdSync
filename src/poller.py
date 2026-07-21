@@ -54,10 +54,12 @@ class Poller:
             logger.exception("не удалось получить задания с LMS")
             return
 
+        logger.info("получено %d заданий от LMS", len(jobs))
         for job in jobs:
             self._process(job, received_at)
 
     def _process(self, job: Job, received_at: datetime) -> None:
+        logger.info("обрабатываю задание %s (%s) для %s", job.id, job.event, job.username)
         handler = self._handlers.get(job.event)
         if handler is None:
             result = HandlerResult("failed", error=f"нет обработчика для события {job.event!r}")
