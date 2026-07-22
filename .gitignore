@@ -2,9 +2,12 @@
 __pycache__/
 *.pyc
 .env
+/adsync.env
+/subjects.yaml
 /data/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 dist/
 *.egg-info/
+.idea/
