@@ -127,3 +127,10 @@ sum(count_over_time({service="fs-adsync"} |= "event=account_created" [1h]))
    `subjects.yaml`); heartbeat `fs-adsync жив` удобно использовать как
    absent-алерт (`absent_over_time` за 2× интервала heartbeat) — единый паттерн
    с fs-video-uploader.
+
+**Принято 2026-07-22** (советы 3–6): `event` — третий лейбл Loki-стрима, без отдельного
+словаря имён (литеральные строки по месту вызова, как решили на fs-video-uploader — 25 мест
+не оправдывают абстракцию). Полный актуальный список значений, уровней и файлов —
+`.docs/basic_doc.md`, раздел «Метрики и алерты в Grafana»; ход работы — `.docs/Tasks.md`,
+«Пост-этап 9 — `event`-лейбл Loki-стрима». Советы 1–2 (единый токен на `zone_violation` с
+маркером `op=`, logfmt-параметры) не делали — вне текущего запроса.

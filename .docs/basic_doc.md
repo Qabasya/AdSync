@@ -205,3 +205,64 @@ curl -s http://localhost:8091/status     # счётчики журнала, из
 ```
 
 Полный контракт `/health`/`/status`/`/reconcile`, а также исходящего REST к WP (HMAC-подпись, формат заданий, обработка ошибок и dead-порог) — `.docs/AdSync_API.md`.
+
+#### Метрики и алерты в Grafana (лейбл `event`)
+
+Записи лога на значимых бизнес-событиях и основных инфраструктурных шагах несут третий
+Loki-лейбл `event` (рядом с `service`/`level`) — фиксированное машинное имя, не зависящее
+от формулировки русского текста. Передаётся через `extra={"event": "..."}` на вызывающей
+стороне, читается `LokiHandler.emit()` (`src/logging_setup.py`). Синхронизировано с тем же
+решением в `fs-video-uploader` (см. его `.docs/basic_doc.md`, раздел «Метрики и алерты в
+Grafana») — оба сервиса пишут в общий Loki. Логи без привязки к конкретному шагу (granular
+LDAP-идемпотентность в `ad.py`, отключённый access-лог uvicorn и т.п. — см.
+`.docs/Events-Logging.md`) лейбла `event` не несут.
+
+| `event` | Уровень | Что означает | Файл |
+|---|---|---|---|
+| `job_received` | INFO | Поллер начал обработку задания из `GET /ad/jobs` | `poller.py` |
+| `job_done` | INFO | Задание обработано успешно, ack отправлен со статусом `done` | `poller.py` |
+| `job_failed` | INFO | Задание обработано с ошибкой, ack отправлен со статусом `failed` (уровень записи всё ещё INFO — сам факт неуспеха отражён в `event`, не в уровне) | `poller.py` |
+| `job_handler_missing` | ERROR | В задании `event`, для которого нет зарегистрированного обработчика | `poller.py` |
+| `job_handler_error` | ERROR (exception) | Необработанное исключение внутри `JobHandler.handle()` | `poller.py` |
+| `job_dead` | ERROR | ≥6 неудач подряд по одному `idempotency_key` — нужен администратор | `poller.py` |
+| `lms_jobs_fetch_error` | ERROR (exception) | Не удалось получить задания с LMS (`GET /ad/jobs`) | `poller.py` |
+| `lms_ack_error` | ERROR (exception) | Не удалось отправить `ack` по обработанному заданию | `poller.py` |
+| `account_created` | INFO | Provision: учётки не было, создана в OU направления (или fallback) | `handlers.py` |
+| `account_reactivated` | INFO | Provision: учётка была в OU «Отчисленные», реактивирована и перенесена обратно | `handlers.py` |
+| `account_updated` | INFO | Provision: учётка уже в управляемой зоне, приведена к целевому состоянию | `handlers.py` |
+| `account_deprovisioned` | INFO | Deprovision выполнен — отключена и перенесена (или уже был идемпотентный случай: учётки нет / уже отключена) | `handlers.py` |
+| `subject_unmapped` | WARNING | `subject_key` не найден в `subjects.yaml`, учётка создаётся в fallback-OU | `handlers.py` |
+| `zone_violation` | ERROR | Учётная запись вне управляемой зоны — ни `provision`, ни `deprovision` её не трогают | `handlers.py` |
+| `reconcile_done` | INFO | Прогон сверки завершён, лишние учётки отключены | `reconcile.py` |
+| `reconcile_aborted` | ERROR | Сверка отменена любым предохранителем (сбой LMS, пустой список, превышен порог) — никто не тронут | `reconcile.py` |
+| `lms_active_logins_fetch_error` | ERROR (exception) | Не удалось получить список активных логинов из LMS для сверки | `reconcile.py` |
+| `reconcile_triggered_manually` | INFO | Администратор запустил сверку через `POST /reconcile`, не дожидаясь планового интервала | `api.py` |
+| `ad_reconnect` | WARNING | Соединение с AD потеряно, выполнено переподключение | `ad.py` |
+| `service_started` | INFO | Сервис запущен (лог сразу после `configure_logging`) | `main.py` |
+| `service_stopped` | INFO | Сервис полностью остановился (конец `main()`, после закрытия клиентов) | `main.py` |
+| `shutdown_signal_received` | INFO | Получен SIGTERM/SIGINT, начат graceful shutdown | `main.py` |
+| `heartbeat` | INFO | Раз в `HEARTBEAT_INTERVAL_SECONDS` — сервис жив, сводка журнала (`done`/`failed`/`dead`) | `main.py` |
+| `daily_summary` | INFO | Суточная сводка (создано/отключено/ошибок за 24ч), если включена `DAILY_SUMMARY_TIME` | `main.py` |
+| `background_loop_error` | ERROR (exception) | Необработанная ошибка тика фонового цикла (`jobs`/`reconcile`/`heartbeat`) | `main.py` |
+| `daily_summary_loop_error` | ERROR (exception) | Необработанная ошибка в потоке дневной сводки | `main.py` |
+
+Примеры LogQL-запросов (Grafana → Explore/Dashboard, источник данных Loki):
+
+```logql
+# счётчик созданных учёток за час
+sum(count_over_time({service="fs-adsync", event="account_created"}[1h]))
+
+# все события, сгруппированные по типу, за сутки
+sum by (event) (count_over_time({service="fs-adsync"}[24h]))
+
+# только dead-задания
+{service="fs-adsync", event="job_dead"}
+```
+
+Кандидаты на алерты (см. также `.docs/Events-Logging.md`):
+
+- `event="job_dead"` (ERROR) — задание не проходит уже 6 попыток подряд, нужен администратор.
+- `event="zone_violation"` (ERROR) — попытка тронуть учётку вне управляемой зоны (provision или deprovision).
+- `event="reconcile_aborted"` (ERROR) — сверка не выполнена ни разу за прогон, зона могла разъехаться с LMS.
+- `event="subject_unmapped"` (WARNING) — нужно дополнить `subjects.yaml`.
+- `event="heartbeat"` — **отсутствие** дольше `2 × HEARTBEAT_INTERVAL_SECONDS` (`absent_over_time`) сигнализирует, что фоновые потоки умерли молча — тот же паттерн, что в `fs-video-uploader`.

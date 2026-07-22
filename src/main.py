@@ -82,7 +82,9 @@ def _loop(
         try:
             tick()
         except Exception:
-            logger.exception("ошибка в фоновом цикле %s", label)
+            logger.exception(
+                "ошибка в фоновом цикле %s", label, extra={"event": "background_loop_error"}
+            )
 
 
 def _daily_summary_loop(
@@ -99,15 +101,18 @@ def _daily_summary_loop(
                 counts.created,
                 counts.disabled,
                 counts.errors,
+                extra={"event": "daily_summary"},
             )
         except Exception:
-            logger.exception("ошибка в потоке дневной сводки")
+            logger.exception(
+                "ошибка в потоке дневной сводки", extra={"event": "daily_summary_loop_error"}
+            )
 
 
 def main() -> None:
     settings = Settings()  # type: ignore[call-arg]
     configure_logging(data_dir=settings.data_dir, loki_url=settings.loki_url)
-    logger.info("fs-adsync запускается")
+    logger.info("fs-adsync запускается", extra={"event": "service_started"})
 
     subjects = load_subjects(settings.subjects_file)
 
@@ -159,7 +164,11 @@ def main() -> None:
     def run_heartbeat_tick() -> None:
         counts = repository.status_counts()
         logger.info(
-            "fs-adsync жив: done=%d, failed=%d, dead=%d", counts.done, counts.failed, counts.dead
+            "fs-adsync жив: done=%d, failed=%d, dead=%d",
+            counts.done,
+            counts.failed,
+            counts.dead,
+            extra={"event": "heartbeat"},
         )
 
     threads = [
@@ -204,7 +213,11 @@ def main() -> None:
     api_thread.start()
 
     def handle_signal(signum: int, _frame: FrameType | None) -> None:
-        logger.info("получен сигнал %s, начинаю остановку", signum)
+        logger.info(
+            "получен сигнал %s, начинаю остановку",
+            signum,
+            extra={"event": "shutdown_signal_received"},
+        )
         stop.set()
         server.should_exit = True
 
@@ -220,7 +233,7 @@ def main() -> None:
     repository.close()
     jobs_directory.close()
     reconcile_directory.close()
-    logger.info("fs-adsync остановлен")
+    logger.info("fs-adsync остановлен", extra={"event": "service_stopped"})
 
 
 if __name__ == "__main__":

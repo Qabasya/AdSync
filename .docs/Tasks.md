@@ -1157,3 +1157,48 @@ uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
 **Definition of Done:** `uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest` — чисто, 90/90. Реализовано по прямому запросу пользователя.
 
 ---
+
+## Пост-этап 9 — `event`-лейбл Loki-стрима (синхронизация с fs-video-uploader)
+
+**Дата:** 2026-07-22. На fs-video-uploader по итогам аудита `.docs/Events-Logging.md`
+добавлен четвёртый лейбл Loki-стрима `event` — фиксированное машинное имя события рядом с
+русским текстом, чтобы Grafana считала счётчики без regexp по формулировке. Решение
+синхронизировано сюда (см. его `CLAUDE.md`, раздел Logging & Notifications) — оба сервиса
+пишут в общий Loki, дашборд по `event` должен работать одинаково для обоих.
+
+**Отличие от fs-video-uploader:** там `event` завязан на 7 типов `EventBus`-события; здесь
+`EventBus` нет (реверчен на этапе 8) — событиями считаются исходы обработки заданий и
+сверки из таблицы «Бизнес-события» в `.docs/Events-Logging.md`, плюс основные
+инфраструктурные логи (старт/стоп, heartbeat, дневная сводка, ошибки фоновых циклов и сети
+к LMS/AD) — по аналогии с тем, что на video-uploader дополнительно затегированы
+`registry_error`/`scan_cycle_error`/`service_started` и т.п. сверх исходных 7 доменных
+событий. Без единого словаря имён (`EVENT_NAMES`) — обсуждали на video-uploader и отказались:
+25 литеральных строк по месту вызова не оправдывают отдельную абстракцию, рассинхрон строк
+ловится тестами, не типами.
+
+**Задачи:**
+
+- `src/logging_setup.py`: `LokiHandler.emit()` — читает `getattr(record, "event", None)`,
+  добавляет третьим лейблом `stream`, только если он есть.
+- `extra={"event": "..."}` на всех значимых логах — `poller.py`, `handlers.py`,
+  `reconcile.py`, `api.py` (ручной запуск сверки), `ad.py` (переподключение), `main.py`
+  (старт/стоп/heartbeat/дневная сводка/сигнал/ошибки фоновых циклов). Полный список из
+  26 значений `event`, с уровнем и файлом — `.docs/basic_doc.md`, раздел «Метрики и алерты
+  в Grafana».
+- `.docs/CLAUDE.md`, раздел Logging & Notifications — снята формулировка «лейблы потока
+  только `service`/`level`», описан `event`-лейбл.
+- `.docs/basic_doc.md` — новый подраздел «Метрики и алерты в Grafana (лейбл `event`)» под
+  «5. Как пользоваться»: таблица всех событий + примеры LogQL + кандидаты на алерты
+  (`job_dead`, `zone_violation`, `reconcile_aborted`, `subject_unmapped`, отсутствие
+  `heartbeat`).
+- Тесты на `event` в `tests/test_logging_setup.py`/бизнес-тестах — **не добавлены** в этом
+  заходе (сделан только код логов + документация, по прямой просьбе пользователя).
+
+**Definition of Done:**
+
+- `uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest` — чисто, 90/90 (тесты не менялись, регрессий нет).
+- Реализовано Claude по прямому запросу пользователя («допиши сам логи и документацию, в таком же ключе, что в fs-video-uploader»).
+- [ ] Тесты на `event` (аналог `test_loki.py`/`test_pipeline.py` на fs-video-uploader) — отдельная задача, если понадобится.
+- [ ] Коммит — на вашей стороне (в обоих репозиториях).
+
+---

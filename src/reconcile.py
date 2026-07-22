@@ -65,7 +65,10 @@ class Reconciler:
         try:
             active_usernames = set(self._lms.get_active_usernames())
         except Exception:
-            logger.exception("не удалось получить список активных логинов из LMS")
+            logger.exception(
+                "не удалось получить список активных логинов из LMS",
+                extra={"event": "lms_active_logins_fetch_error"},
+            )
             return self._abort("сбой получения списка от LMS")
 
         if not active_usernames and zone_accounts:
@@ -96,10 +99,13 @@ class Reconciler:
             disabled.append(account.username)
 
         logger.info(
-            "сверка завершена: отключено %d из %d учёток зоны", len(disabled), len(zone_accounts)
+            "сверка завершена: отключено %d из %d учёток зоны",
+            len(disabled),
+            len(zone_accounts),
+            extra={"event": "reconcile_done"},
         )
         return ReconcileResult(tuple(disabled), aborted=False)
 
     def _abort(self, reason: str) -> ReconcileResult:
-        logger.error("Сверка отменена: %s", reason)
+        logger.error("Сверка отменена: %s", reason, extra={"event": "reconcile_aborted"})
         return ReconcileResult((), aborted=True, abort_reason=reason)

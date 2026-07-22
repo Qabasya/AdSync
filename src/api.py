@@ -113,7 +113,10 @@ def create_api(
 
     @app.post("/reconcile")
     def trigger_reconcile() -> ReconcileResponse:
-        logger.info("внеочередная сверка запущена через POST /reconcile")
+        logger.info(
+            "внеочередная сверка запущена через POST /reconcile",
+            extra={"event": "reconcile_triggered_manually"},
+        )
         result = run_reconcile()
         return ReconcileResponse(
             aborted=result.aborted,

@@ -51,7 +51,9 @@ class Poller:
         try:
             jobs = self._lms.get_jobs(self._jobs_limit)
         except Exception:
-            logger.exception("не удалось получить задания с LMS")
+            logger.exception(
+                "не удалось получить задания с LMS", extra={"event": "lms_jobs_fetch_error"}
+            )
             return
 
         # logger.info("получено %d заданий от LMS", len(jobs))
@@ -59,10 +61,21 @@ class Poller:
             self._process(job, received_at)
 
     def _process(self, job: Job, received_at: datetime) -> None:
-        logger.info("обрабатываю задание %s (%s) для %s", job.id, job.event, job.username)
+        logger.info(
+            "обрабатываю задание %s (%s) для %s",
+            job.id,
+            job.event,
+            job.username,
+            extra={"event": "job_received"},
+        )
         handler = self._handlers.get(job.event)
         if handler is None:
-            logger.error("нет обработчика для события %r у задания %s", job.event, job.id)
+            logger.error(
+                "нет обработчика для события %r у задания %s",
+                job.event,
+                job.id,
+                extra={"event": "job_handler_missing"},
+            )
             result = HandlerResult("failed", error=f"нет обработчика для события {job.event!r}")
         else:
             result = self._run_handler(handler, job)
@@ -71,7 +84,12 @@ class Poller:
         try:
             self._lms.ack(AckRequest(id=job.id, status=result.status, error=result.error))
         except Exception:
-            logger.exception("не удалось отправить ack для задания %s (%s)", job.id, job.event)
+            logger.exception(
+                "не удалось отправить ack для задания %s (%s)",
+                job.id,
+                job.event,
+                extra={"event": "lms_ack_error"},
+            )
             return
 
         subject_key = job.subject_key if isinstance(job, ProvisionJob) else None
@@ -94,6 +112,7 @@ class Poller:
             job.event,
             job.username,
             result.status,
+            extra={"event": "job_done" if result.status == "done" else "job_failed"},
         )
 
         if result.status == "failed":
@@ -104,6 +123,7 @@ class Poller:
                     job.idempotency_key,
                     job.event,
                     dead,
+                    extra={"event": "job_dead"},
                 )
 
     def _run_handler(self, handler: JobHandler, job: Job) -> HandlerResult:
@@ -111,6 +131,10 @@ class Poller:
             return handler.handle(job)
         except Exception as exc:
             logger.exception(
-                "ошибка обработки задания %s (%s) для %s", job.id, job.event, job.username
+                "ошибка обработки задания %s (%s) для %s",
+                job.id,
+                job.event,
+                job.username,
+                extra={"event": "job_handler_error"},
             )
             return HandlerResult("failed", error=str(exc))

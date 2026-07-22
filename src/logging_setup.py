@@ -63,10 +63,17 @@ class LokiHandler(logging.Handler):
                 self._client = self._build_client()
             line = self.format(record)
             timestamp_ns = str(int(record.created * 1_000_000_000))
+            stream_labels: dict[str, str] = {
+                "service": self._service,
+                "level": record.levelname.lower(),
+            }
+            event = getattr(record, "event", None)
+            if event is not None:
+                stream_labels["event"] = str(event)
             payload = {
                 "streams": [
                     {
-                        "stream": {"service": self._service, "level": record.levelname.lower()},
+                        "stream": stream_labels,
                         "values": [[timestamp_ns, line]],
                     }
                 ]

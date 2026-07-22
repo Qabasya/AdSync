@@ -196,7 +196,11 @@ class AdGateway:
         try:
             return operation()
         except LDAPCommunicationError as exc:
-            logger.warning("Соединение с AD потеряно, переподключаюсь: %s", exc)
+            logger.warning(
+                "Соединение с AD потеряно, переподключаюсь: %s",
+                exc,
+                extra={"event": "ad_reconnect"},
+            )
             self._connection = self._reconnect()
             return operation()
 
