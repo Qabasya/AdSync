@@ -113,6 +113,7 @@ def main() -> None:
     settings = Settings()  # type: ignore[call-arg]
     configure_logging(data_dir=settings.data_dir, loki_url=settings.loki_url)
     logger.info("fs-adsync запускается", extra={"event": "service_started"})
+    started_at = _now()
 
     subjects = load_subjects(settings.subjects_file)
 
@@ -163,8 +164,10 @@ def main() -> None:
 
     def run_heartbeat_tick() -> None:
         counts = repository.status_counts()
+        uptime_hours = (_now() - started_at).total_seconds() / 3600
         logger.info(
-            "fs-adsync жив: done=%d, failed=%d, dead=%d",
+            "fs-adsync жив: uptime_hours=%.2f, done=%d, failed=%d, dead=%d",
+            uptime_hours,
             counts.done,
             counts.failed,
             counts.dead,

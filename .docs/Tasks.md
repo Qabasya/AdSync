@@ -1202,3 +1202,40 @@ uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
 - [ ] Коммит — на вашей стороне (в обоих репозиториях).
 
 ---
+
+## Пост-этап 9 — гейдж «сколько часов сервис жив» в Grafana (синхронизация с fs-video-uploader)
+
+**Дата:** 2026-07-23. Первый счётчик из набора, который пользователь настраивает в Grafana; решение и
+формат синхронизированы с fs-video-uploader (см. его `.docs/Tasks.md`, «Доп. правка — гейдж «сколько
+часов сервис жив»»). Loki-стек здесь тоже единственный источник метрик, тело строки — обычный текст,
+поэтому `time() - process_start_time_seconds` (Prometheus-приём) не подходит: нужен самоотчёт числа
+часов аптайма прямо в тексте heartbeat-строки, а Grafana достаёт его `regexp` + `unwrap`.
+
+**Решения** (идентичны video-uploader):
+
+1. Без нового события/интервала — переиспользуется существующий `run_heartbeat_tick`
+   (`main.py`, `event=heartbeat`, период `heartbeat_interval_seconds`, default 3600 c).
+2. Момент старта — локальная переменная `started_at = _now()` в `main()`, взятая сразу после
+   `logger.info("fs-adsync запускается", ...)`; замыкание `run_heartbeat_tick` считает
+   `uptime_hours = (_now() - started_at).total_seconds() / 3600` на каждый тик.
+3. Формат строки: `"fs-adsync жив: uptime_hours=%.2f, done=%d, failed=%d, dead=%d"` — тот же
+   токен `uptime_hours=<float>`, что и на video-uploader, для одинакового LogQL-запроса в Grafana
+   на обоих сервисах.
+
+**Задачи:**
+
+- [x] `src/main.py`: `started_at = _now()` после лога `service_started`.
+- [x] `src/main.py::run_heartbeat_tick`: считает `uptime_hours`, включает в лог.
+- [x] Тесты на текст heartbeat-лога в `tests/` не найдены — обновлять нечего (в отличие от
+      video-uploader, где `test_main.py::TestHeartbeat` уже проверял текст сообщения).
+- [ ] Grafana: панель Gauge (LogQL идентичен video-uploader, `service="fs-adsync"` вместо
+      `service="fs-video-uploader"`) — вне DoD этого репозитория.
+- [x] **Написано Claude по прямой просьбе** («допиши код здесь и в AdSync»).
+
+**Definition of Done:**
+
+- [x] `uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest` — чисто, 90/90.
+- [x] Ревью Claude (сам автор правки в этот раз).
+- [ ] Коммит — на вашей стороне.
+
+---
