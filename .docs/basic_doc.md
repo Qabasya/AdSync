@@ -227,6 +227,8 @@ LDAP-идемпотентность в `ad.py`, отключённый access-л
 | `job_dead` | ERROR | ≥6 неудач подряд по одному `idempotency_key` — нужен администратор | `poller.py` |
 | `lms_jobs_fetch_error` | ERROR (exception) | Не удалось получить задания с LMS (`GET /ad/jobs`) | `poller.py` |
 | `lms_ack_error` | ERROR (exception) | Не удалось отправить `ack` по обработанному заданию | `poller.py` |
+| `lms_module_unavailable` | WARNING | LMS отвечает 404: модуль AdSync на сайте выключен (или неверен `LMS_BASE_URL`). Пишется **один раз на переход состояния** в поллере (и на каждом пропущенном прогоне сверки — он редкий) | `poller.py`, `reconcile.py` |
+| `lms_module_available` | INFO | Модуль на сайте снова отвечает, опрос заданий возобновлён (парный лог к `lms_module_unavailable`) | `poller.py` |
 | `account_created` | INFO | Provision: учётки не было, создана в OU направления (или fallback) | `handlers.py` |
 | `account_reactivated` | INFO | Provision: учётка была в OU «Отчисленные», реактивирована и перенесена обратно | `handlers.py` |
 | `account_updated` | INFO | Provision: учётка уже в управляемой зоне, приведена к целевому состоянию | `handlers.py` |

@@ -10,6 +10,7 @@ from fakes import FakeDirectoryGateway, FakeLmsApi
 
 from config import SubjectConfig
 from handlers import DeprovisionHandler, HandlerResult, ProvisionHandler
+from lms import LmsModuleUnavailableError
 from models import DeprovisionJob, Job, ProvisionJob
 from poller import Poller
 from repository import JobLogEntry, JobRepository
@@ -29,6 +30,19 @@ class RaisingHandler:
 
     def handle(self, job: Job) -> HandlerResult:
         raise RuntimeError("boom")
+
+
+class ModuleDisabledLmsApi(FakeLmsApi):
+    """Фейк LMS с выключенным на сайте модулем AdSync: `get_jobs` отвечает 404, пока не включат."""
+
+    def __init__(self, jobs: list[Job] | None = None) -> None:
+        super().__init__(jobs=jobs)
+        self.module_enabled = False
+
+    def get_jobs(self, limit: int) -> list[Job]:
+        if not self.module_enabled:
+            raise LmsModuleUnavailableError("GET /ad/jobs → 404")
+        return super().get_jobs(limit)
 
 
 class RaisingForUsernameHandler:
@@ -224,6 +238,42 @@ def test_dead_threshold_logs_error_on_sixth_failure(
     repository.close()
 
     assert "мертво" in caplog.text
+
+
+def test_disabled_module_logs_once_and_reports_recovery(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Выключенный на сайте модуль: одна WARNING на всю паузу, INFO — на возвращение."""
+    directory = make_directory()
+    jobs: list[Job] = [
+        DeprovisionJob(id=1, event="deprovision", idempotency_key="k1", username="ghost"),
+    ]
+    lms = ModuleDisabledLmsApi(jobs=jobs)
+    repository = JobRepository(tmp_path / "state.db")
+    poller = make_poller(lms, repository, make_handlers(directory))
+
+    with caplog.at_level(logging.INFO, logger="adsync.poller"):
+        poller.run_once()
+        poller.run_once()
+        poller.run_once()
+
+        unavailable = [
+            r for r in caplog.records if getattr(r, "event", None) == "lms_module_unavailable"
+        ]
+        assert len(unavailable) == 1
+        assert unavailable[0].levelno == logging.WARNING
+        assert unavailable[0].exc_info is None
+        assert lms.acks == []
+
+        lms.module_enabled = True
+        poller.run_once()
+
+    repository.close()
+
+    available = [r for r in caplog.records if getattr(r, "event", None) == "lms_module_available"]
+    assert len(available) == 1
+    assert available[0].levelno == logging.INFO
+    assert [ack.id for ack in lms.acks] == [1]
 
 
 def test_missing_handler_for_event_fails_gracefully(tmp_path: Path) -> None:

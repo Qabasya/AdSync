@@ -1,7 +1,8 @@
 """Клиент LMS REST API (`FS_LMS_API.md` §3): задания, ack, список активных логинов.
 
 Подпись запросов — HMAC по `FS_LMS_API.md` §2, только stdlib `time`/`hmac`/`hashlib`.
-Собственных ретраев нет: сетевые и HTTP-ошибки пробрасываются вызывающему коду.
+Собственных ретраев нет: сетевые и HTTP-ошибки пробрасываются вызывающему коду; 404 —
+отдельным типом `LmsModuleUnavailableError`, это не сбой, а выключенный модуль на сайте.
 """
 
 import hashlib
@@ -14,6 +15,16 @@ import httpx
 from models import AckRequest, ActiveUsernamesResponse, Job, JobsResponse
 
 _ACTIVE_USERNAMES_TIMEOUT = 30.0
+
+
+class LmsModuleUnavailableError(Exception):
+    """LMS ответила 404: модуль AdSync на сайте отключён (или `LMS_BASE_URL` указан неверно).
+
+    Отдельный тип, а не общий `httpx.HTTPStatusError`, ровно по одной причине: это устойчивое
+    ожидаемое состояние (админ выключил «Синхронизацию с доменом (AD)» в админке WP), а не сбой.
+    Вызывающий код логирует его один раз — на переходе состояния, — вместо traceback'а на каждом
+    тике опроса. Иерархии собственных исключений над ним нет и не планируется.
+    """
 
 
 class LmsApi(Protocol):
@@ -61,12 +72,26 @@ class LmsClient:
         ).hexdigest()
         return {"X-Fs-Timestamp": timestamp, "X-Fs-Signature": signature}
 
+    @staticmethod
+    def _raise_for_status(response: httpx.Response) -> None:
+        """404 → `LmsModuleUnavailableError`; прочие не-2xx — как раньше, `httpx.HTTPStatusError`.
+
+        404 отдаёт и WP при отключённом модуле (`rest_no_route`), и любой прокси перед сайтом —
+        для сервиса разницы нет: маршрута AdSync на том конце сейчас не существует.
+        """
+        if response.status_code == httpx.codes.NOT_FOUND:
+            raise LmsModuleUnavailableError(
+                f"{response.request.method} {response.request.url} → 404 "
+                "(модуль AdSync на сайте отключён либо LMS_BASE_URL неверен)"
+            )
+        response.raise_for_status()
+
     def get_jobs(self, limit: int) -> list[Job]:
         """`GET /ad/jobs?limit=…` — тело для подписи пустое (GET)."""
         response = self._client.get(
             "/ad/jobs", params={"limit": limit}, headers=self._signed_headers("")
         )
-        response.raise_for_status()
+        self._raise_for_status(response)
         return JobsResponse.model_validate(response.json()).jobs
 
     def ack(self, request: AckRequest) -> None:
@@ -75,7 +100,7 @@ class LmsClient:
         headers = self._signed_headers(body)
         headers["Content-Type"] = "application/json"
         response = self._client.post("/ad/ack", content=body, headers=headers)
-        response.raise_for_status()
+        self._raise_for_status(response)
 
     def get_active_usernames(self) -> list[str]:
         """`GET /ad/active-usernames` — список может быть большим, таймаут увеличен."""
@@ -84,7 +109,7 @@ class LmsClient:
             headers=self._signed_headers(""),
             timeout=_ACTIVE_USERNAMES_TIMEOUT,
         )
-        response.raise_for_status()
+        self._raise_for_status(response)
         return ActiveUsernamesResponse.model_validate(response.json()).usernames
 
     def close(self) -> None:

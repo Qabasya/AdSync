@@ -10,7 +10,7 @@ import json
 import httpx
 import pytest
 
-from lms import LmsClient
+from lms import LmsClient, LmsModuleUnavailableError
 from models import AckRequest, DeprovisionJob, ProvisionJob
 
 SECRET = "test-secret"
@@ -117,6 +117,23 @@ def test_get_active_usernames_signs_empty_body_and_parses() -> None:
     timestamp = request.headers["X-Fs-Timestamp"]
     assert request.headers["X-Fs-Signature"] == _expected_signature(SECRET, timestamp, "")
     assert usernames == ["i.petrov", "a.sidorov"]
+
+
+def test_404_raises_module_unavailable_on_every_endpoint() -> None:
+    """Отключённый на сайте модуль AdSync = `rest_no_route` 404 на всех трёх эндпоинтах."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"code": "rest_no_route", "message": "No route was found"})
+
+    client = LmsClient(BASE_URL, SECRET, transport=httpx.MockTransport(handler))
+
+    with pytest.raises(LmsModuleUnavailableError):
+        client.get_jobs(limit=50)
+    with pytest.raises(LmsModuleUnavailableError):
+        client.ack(AckRequest(id=7, status="done"))
+    with pytest.raises(LmsModuleUnavailableError):
+        client.get_active_usernames()
+    client.close()
 
 
 def test_get_jobs_raises_on_non_2xx_without_retry() -> None:

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from ad import DirectoryGateway
-from lms import LmsApi
+from lms import LmsApi, LmsModuleUnavailableError
 
 logger = logging.getLogger("adsync.reconcile")
 
@@ -64,6 +64,17 @@ class Reconciler:
 
         try:
             active_usernames = set(self._lms.get_active_usernames())
+        except LmsModuleUnavailableError as exc:
+            # Не предохранитель и не сбой: сверять не с чем, пока модуль на сайте выключен —
+            # WARNING без traceback, чтобы не поднимать ложную тревогу по `level="error"`.
+            logger.warning(
+                "сверка пропущена: синхронизация с доменом на стороне LMS выключена (%s)",
+                exc,
+                extra={"event": "lms_module_unavailable"},
+            )
+            return ReconcileResult(
+                (), aborted=True, abort_reason="синхронизация с доменом на стороне LMS выключена"
+            )
         except Exception:
             logger.exception(
                 "не удалось получить список активных логинов из LMS",

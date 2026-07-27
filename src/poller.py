@@ -9,7 +9,7 @@ from collections.abc import Callable
 from datetime import datetime
 
 from handlers import HandlerResult, JobHandler
-from lms import LmsApi
+from lms import LmsApi, LmsModuleUnavailableError
 from models import AckRequest, Job, ProvisionJob
 from repository import JobLogEntry, JobRepository
 
@@ -44,21 +44,52 @@ class Poller:
         self._repository = repository
         self._jobs_limit = jobs_limit
         self._now = now
+        self._module_unavailable = False
 
     def run_once(self) -> None:
         """Один тик: fetch → dispatch → ack → журнал. Ошибка тика не пробрасывается наружу."""
         received_at = self._now()
         try:
             jobs = self._lms.get_jobs(self._jobs_limit)
+        except LmsModuleUnavailableError as exc:
+            self._note_module_unavailable(exc)
+            return
         except Exception:
             logger.exception(
                 "не удалось получить задания с LMS", extra={"event": "lms_jobs_fetch_error"}
             )
             return
 
+        self._note_module_available()
         # logger.info("получено %d заданий от LMS", len(jobs))
         for job in jobs:
             self._process(job, received_at)
+
+    def _note_module_unavailable(self, exc: LmsModuleUnavailableError) -> None:
+        """Логирует выключенный на сайте модуль ровно один раз — на переходе в это состояние.
+
+        Модуль выключают в админке WP надолго (часы, дни), а тик заданий идёт каждые несколько
+        секунд: traceback на каждый тик забил бы и файл, и Loki, скрыв под собой настоящие ошибки.
+        """
+        if self._module_unavailable:
+            return
+        self._module_unavailable = True
+        logger.warning(
+            "синхронизация с доменом на стороне LMS выключена: %s. Продолжаю опрос молча — "
+            "сообщу, когда модуль снова ответит",
+            exc,
+            extra={"event": "lms_module_unavailable"},
+        )
+
+    def _note_module_available(self) -> None:
+        """Парный лог к `_note_module_unavailable`: модуль снова отвечает — молчание закончилось."""
+        if not self._module_unavailable:
+            return
+        self._module_unavailable = False
+        logger.info(
+            "синхронизация с доменом на стороне LMS снова доступна",
+            extra={"event": "lms_module_available"},
+        )
 
     def _process(self, job: Job, received_at: datetime) -> None:
         logger.info(
@@ -83,6 +114,11 @@ class Poller:
         acked_at = self._now()
         try:
             self._lms.ack(AckRequest(id=job.id, status=result.status, error=result.error))
+        except LmsModuleUnavailableError as exc:
+            # Модуль выключили между fetch и ack: без этой ветки каждое задание пачки (до 200)
+            # дало бы собственный traceback. WP переотдаст задание после включения — ack не потерян.
+            self._note_module_unavailable(exc)
+            return
         except Exception:
             logger.exception(
                 "не удалось отправить ack для задания %s (%s)",

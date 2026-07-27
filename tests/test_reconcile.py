@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from fakes import FakeDirectoryGateway, FakeLmsApi
 
+from lms import LmsModuleUnavailableError
 from reconcile import Reconciler
 
 OU_SUBJECT = "OU=KEGE,OU=Ученики,DC=fs,DC=loc"
@@ -21,6 +22,13 @@ class FailingLmsApi(FakeLmsApi):
 
     def get_active_usernames(self) -> list[str]:
         raise RuntimeError("network down")
+
+
+class ModuleDisabledLmsApi(FakeLmsApi):
+    """Фейк LMS с выключенным на сайте модулем AdSync: эндпоинт отвечает 404."""
+
+    def get_active_usernames(self) -> list[str]:
+        raise LmsModuleUnavailableError("GET /ad/active-usernames → 404")
 
 
 def make_directory() -> FakeDirectoryGateway:
@@ -197,6 +205,28 @@ def test_get_active_usernames_failure_aborts(caplog: pytest.LogCaptureFixture) -
     assert result.aborted is True
     assert directory.users_by_username["a"].enabled is True
     assert "не удалось получить список активных логинов" in caplog.text
+
+
+def test_disabled_module_skips_reconcile_without_error_level(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Модуль выключен на сайте — сверять не с чем: пропуск WARNING'ом, без ложной тревоги ERROR."""
+    directory = make_directory()
+    seed_active_account(
+        directory, ou_dn=OU_SUBJECT, username="a", first="A", last="A", created_at=_OLD
+    )
+    lms = ModuleDisabledLmsApi()
+    reconciler = make_reconciler(directory, lms)
+
+    with caplog.at_level(logging.WARNING, logger="adsync.reconcile"):
+        result = reconciler.run_once()
+
+    assert result.aborted is True
+    assert result.disabled_usernames == ()
+    assert directory.users_by_username["a"].enabled is True
+    assert [record.levelno for record in caplog.records] == [logging.WARNING]
+    assert getattr(caplog.records[0], "event", None) == "lms_module_unavailable"
+    assert caplog.records[0].exc_info is None
 
 
 def test_reconcile_is_one_directional_never_enables_or_creates() -> None:

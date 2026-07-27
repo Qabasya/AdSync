@@ -1239,3 +1239,44 @@ uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest
 - [ ] Коммит — на вашей стороне.
 
 ---
+
+## Пост-этап 9 — 404 от LMS ≠ ошибка: распознавание выключенного на сайте модуля AdSync
+
+**Дата:** 2026-07-27. Пользователь временно снял галку «Синхронизация с доменом (AD)» в админке WP
+и получил в логах `httpx.HTTPStatusError: Client error '404 Not Found'` с полным traceback'ом на
+каждом тике заданий (~3 с). Сервис при этом полностью исправен — в логе тонули настоящие ошибки, а
+Grafana-алерт по `level="error"` срабатывал бы на штатной ситуации.
+
+**Решения:**
+
+1. `LmsClient._raise_for_status()`: 404 (на любом из трёх эндпоинтов) → `LmsModuleUnavailableError`;
+   прочие не-2xx — как раньше, `httpx.HTTPStatusError`. Собственное исключение появилось потому,
+   что `httpx` по Strict Rules живёт только внутри `lms.py` — поллер не может смотреть на статус-код
+   сам. Иерархии над ним нет, оговорка внесена в `.docs/CLAUDE.md`.
+2. `Poller`: поле `_module_unavailable` — лог **один раз на переход состояния**
+   (WARNING `lms_module_unavailable`, без traceback), возврат модуля — INFO
+   `lms_module_available`. Ветка добавлена и в `ack` (модуль могли выключить между fetch и ack —
+   иначе пачка до 200 заданий дала бы по traceback'у на каждое).
+3. `Reconciler`: 404 → WARNING + пропуск прогона, **не** через `_abort()` — это не срабатывание
+   предохранителя, `event=reconcile_aborted` и ERROR не поднимаются.
+4. Интервал опроса при выключенном модуле сознательно не разрежается: включённую обратно
+   синхронизацию сервис обязан подхватить в те же секунды, что и обычно.
+
+**Задачи:**
+
+- [x] `src/lms.py`: `LmsModuleUnavailableError` + `_raise_for_status()` во всех трёх методах.
+- [x] `src/poller.py`: `_note_module_unavailable()` / `_note_module_available()`, ветки в `run_once`
+      и в отправке ack.
+- [x] `src/reconcile.py`: ветка 404 — WARNING и пропуск прогона.
+- [x] Тесты: `test_lms.py` (404 на всех эндпоинтах), `test_poller.py` (одна WARNING на три тика +
+      INFO на возврате, задания забираются после включения), `test_reconcile.py` (пропуск без
+      записей уровня ERROR).
+- [x] Документация: `.docs/CLAUDE.md` (REST-контракт, уровни логов, Strict Rules),
+      `.docs/Events-Logging.md`, `.docs/basic_doc.md` (два новых значения лейбла `event`).
+
+**Definition of Done:**
+
+- [x] `uv run ruff format . && uv run ruff check . && uv run mypy src && uv run pytest` — чисто, 93/93.
+- [ ] Коммит — на вашей стороне.
+
+---
