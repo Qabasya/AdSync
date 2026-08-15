@@ -89,7 +89,7 @@ def _is_within_ou(dn: str, ou_dn: str) -> bool:
     ou_parts = _dn_components(ou_dn)
     if len(dn_parts) <= len(ou_parts):
         return False
-    return dn_parts[-len(ou_parts) :] == ou_parts
+    return dn_parts[-len(ou_parts):] == ou_parts
 
 
 def _dn_equals(left: str, right: str) -> bool:
@@ -157,14 +157,14 @@ class AdGateway:
     """Боевая реализация `DirectoryGateway` поверх `ldap3`."""
 
     def __init__(
-        self,
-        connection: Connection,
-        *,
-        reconnect: Callable[[], Connection],
-        subjects: dict[str, SubjectConfig],
-        ou_disabled: str,
-        ou_fallback: str,
-        upn_suffix: str,
+            self,
+            connection: Connection,
+            *,
+            reconnect: Callable[[], Connection],
+            subjects: dict[str, SubjectConfig],
+            ou_disabled: str,
+            ou_fallback: str,
+            upn_suffix: str,
     ) -> None:
         """Создаёт шлюз поверх уже установленного соединения.
 
@@ -388,7 +388,7 @@ class AdGateway:
 
 
 def build_ldaps_connection(
-    *, host: str, port: int, ca_cert_path: Path, bind_dn: str, bind_password: str
+        *, host: str, port: int, ca_cert_path: Path, bind_dn: str, bind_password: str
 ) -> Connection:
     """Собирает боевое LDAPS-соединение с верификацией сертификата DC по `ca_cert_path`.
 
