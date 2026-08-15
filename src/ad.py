@@ -56,11 +56,15 @@ class ZoneAccount:
 
 
 def _parse_when_created(value: object) -> datetime:
-    """Разбирает `whenCreated` (формат `GeneralizedTime` AD) в aware `datetime` (UTC).
+    """Разбирает `whenCreated` в aware `datetime` (UTC).
 
-    Не полагается на автоформатирование `ldap3` — оно недоступно в `MOCK_SYNC` и зависит от
-    online-схемы на настоящем сервере; разбор регэкспом одинаково работает в обоих случаях.
+        На боевом LDAP ldap3 при online-схеме возвращает уже `datetime`; в `MOCK_SYNC`
+        и при отсутствии схемы — сырую строку `GeneralizedTime`. Поддерживаем оба случая.
     """
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
     text = str(value)
     match = _WHEN_CREATED_RE.match(text)
     if not match:
