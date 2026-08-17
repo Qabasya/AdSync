@@ -67,9 +67,15 @@ def _parse_when_created(value: object) -> datetime:
         return value.astimezone(UTC)
     text = str(value)
     match = _WHEN_CREATED_RE.match(text)
-    if not match:
-        raise ValueError(f"неожиданный формат whenCreated: {text!r}")
-    return datetime.strptime(match.group(1), "%Y%m%d%H%M%S").replace(tzinfo=UTC)
+    if match:
+        return datetime.strptime(match.group(1), "%Y%m%d%H%M%S").replace(tzinfo=UTC)
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        raise ValueError(f"неожиданный формат whenCreated: {text!r}") from None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 class OutsideManagedZoneError(Exception):
