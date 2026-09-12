@@ -128,7 +128,7 @@ sum(count_over_time({service="fs-adsync"} |= "event=account_created" [1h]))
 5. **Единый словарь имён событий** в snake_case, чтобы код, логи и дашборды
    говорили на одном языке: `job_received`, `account_created`,
    `account_reactivated`, `account_updated`, `account_deprovisioned`,
-   `subject_unmapped`, `zone_violation`, `job_done`, `job_failed`, `job_dead`,
+   `subject_unmapped`, `zone_violation`, `job_done`, `job_failed`, `job_dead`, `cn_collision`,
    `reconcile_done`, `reconcile_aborted`, `heartbeat`, `daily_summary`.
 6. **Для алертов** главные кандидаты: `job_dead` и `reconcile_aborted` (ERROR,
    требуют вмешательства), `subject_unmapped` (WARNING, надо дополнить

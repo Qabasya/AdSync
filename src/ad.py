@@ -7,7 +7,7 @@
 import logging
 import re
 import ssl
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
@@ -36,6 +36,11 @@ T = TypeVar("T")
 
 _WHEN_CREATED_RE = re.compile(r"^(\d{14})(?:\.\d+)?Z$")
 
+# Сколько вариантов CN пробуем, прежде чем сдаться. Второй кандидат уже содержит логин, который
+# уникален в домене, поэтому реально дальше него доходит только совсем вырожденный случай
+# (объект, названный ровно «Имя Фамилия (логин)», заведённый руками).
+_MAX_CN_CANDIDATES = 10
+
 
 @dataclass(frozen=True, slots=True)
 class DirectoryUser:
@@ -58,8 +63,8 @@ class ZoneAccount:
 def _parse_when_created(value: object) -> datetime:
     """Разбирает `whenCreated` в aware `datetime` (UTC).
 
-        На боевом LDAP ldap3 при online-схеме возвращает уже `datetime`; в `MOCK_SYNC`
-        и при отсутствии схемы — сырую строку `GeneralizedTime`. Поддерживаем оба случая.
+    На боевом LDAP ldap3 при online-схеме возвращает уже `datetime`; в `MOCK_SYNC`
+    и при отсутствии схемы — сырую строку `GeneralizedTime`. Поддерживаем оба случая.
     """
     if isinstance(value, datetime):
         if value.tzinfo is None:
@@ -86,6 +91,10 @@ class ManagedZoneConfigError(Exception):
     """На старте в AD не найден один или несколько DN из конфигурации."""
 
 
+class CnAllocationError(Exception):
+    """В целевой OU не удалось подобрать свободный CN — объект не создан и не перенесён."""
+
+
 def _dn_components(dn: str) -> list[tuple[str, str]]:
     return [(attr.lower(), value.lower()) for attr, value, _ in parse_dn(dn)]
 
@@ -95,11 +104,24 @@ def _is_within_ou(dn: str, ou_dn: str) -> bool:
     ou_parts = _dn_components(ou_dn)
     if len(dn_parts) <= len(ou_parts):
         return False
-    return dn_parts[-len(ou_parts):] == ou_parts
+    return dn_parts[-len(ou_parts) :] == ou_parts
 
 
 def _dn_equals(left: str, right: str) -> bool:
     return _dn_components(left) == _dn_components(right)
+
+
+def _cn_candidates(display_name: str, username: str) -> Iterator[str]:
+    """Варианты CN для объекта: сначала «Имя Фамилия», при занятости — с логином в скобках.
+
+    CN уникален только в пределах своей OU, а `sAMAccountName` — во всём домене. У двух тёзок в
+    одном направлении совпадает именно CN, поэтому различать их нужно логином: «Иван Петров» →
+    «Иван Петров (i.petrov2)». `displayName` при этом остаётся человеческим у обоих.
+    """
+    yield display_name
+    yield f"{display_name} ({username})"
+    for suffix in range(2, _MAX_CN_CANDIDATES):
+        yield f"{display_name} ({username} {suffix})"
 
 
 def _parent_ou(dn: str) -> str:
@@ -163,14 +185,14 @@ class AdGateway:
     """Боевая реализация `DirectoryGateway` поверх `ldap3`."""
 
     def __init__(
-            self,
-            connection: Connection,
-            *,
-            reconnect: Callable[[], Connection],
-            subjects: dict[str, SubjectConfig],
-            ou_disabled: str,
-            ou_fallback: str,
-            upn_suffix: str,
+        self,
+        connection: Connection,
+        *,
+        reconnect: Callable[[], Connection],
+        subjects: dict[str, SubjectConfig],
+        ou_disabled: str,
+        ou_fallback: str,
+        upn_suffix: str,
     ) -> None:
         """Создаёт шлюз поверх уже установленного соединения.
 
@@ -251,8 +273,14 @@ class AdGateway:
         )
 
     def create_user(self, *, ou_dn: str, username: str, first: str, last: str) -> str:
+        """Создаёт учётку, подбирая свободный CN, если в OU уже есть тёзка.
+
+        `entryAlreadyExists` здесь означает две разные вещи, и путать их нельзя: либо это наша же
+        учётка с прошлой попытки (повтор задания — успех, ничего не делаем), либо это ДРУГОЙ
+        человек с тем же ФИО. Во втором случае продолжать работу с чужим DN недопустимо — тёзка
+        получает собственный CN с логином в скобках.
+        """
         display_name = f"{first} {last}"
-        dn = f"CN={escape_rdn(display_name)},{ou_dn}"
         attributes = {
             "sAMAccountName": username,
             "userPrincipalName": f"{username}@{self._upn_suffix}",
@@ -264,15 +292,54 @@ class AdGateway:
             "userAccountControl": _ACCOUNT_DISABLED,
         }
 
+        for candidate_cn in _cn_candidates(display_name, username):
+            dn = f"CN={escape_rdn(candidate_cn)},{ou_dn}"
+            try:
+                self._run(partial(self._add_user, dn, attributes))
+            except LDAPEntryAlreadyExistsResult:
+                if self._owns_dn(dn, username):
+                    logger.info("учётная запись уже существует, создание пропущено: %s", dn)
+                    return dn
+                logger.warning(
+                    "CN %s в %s занят другой учётной записью, подбираю следующий вариант",
+                    candidate_cn,
+                    ou_dn,
+                    extra={"event": "cn_collision"},
+                )
+                continue
+            self._log_result("создана учётная запись (отключена)", dn)
+            return dn
+
+        raise CnAllocationError(
+            f"не удалось подобрать свободный CN для {username} в {ou_dn} "
+            f"за {_MAX_CN_CANDIDATES} попыток"
+        )
+
+    def _add_user(self, dn: str, attributes: dict[str, object]) -> bool:
+        return bool(self._connection.add(dn, _USER_OBJECT_CLASSES, attributes))
+
+    def _owns_dn(self, dn: str, username: str) -> bool:
+        """Принадлежит ли объект по `dn` учётке `username` (сравнение `sAMAccountName`)."""
+        existing = self._read_sam_account_name(dn)
+        return existing is not None and existing.casefold() == username.casefold()
+
+    def _read_sam_account_name(self, dn: str) -> str | None:
+        """`sAMAccountName` объекта по DN; `None`, если объекта нет или атрибут пуст."""
+
         def op() -> bool:
-            return bool(self._connection.add(dn, _USER_OBJECT_CLASSES, attributes))
+            return bool(
+                self._connection.search(dn, "(objectClass=*)", BASE, attributes=["sAMAccountName"])
+            )
 
         try:
             self._run(op)
-            self._log_result("создана учётная запись (отключена)", dn)
-        except LDAPEntryAlreadyExistsResult:
-            logger.info("учётная запись уже существует, создание пропущено: %s", dn)
-        return dn
+        except LDAPNoSuchObjectResult:
+            return None
+        entries = self._connection.entries
+        if not entries:
+            return None
+        value = entries[0]["sAMAccountName"].value
+        return str(value) if value else None
 
     def ensure_password(self, dn: str, password: str) -> None:
         if not self.is_in_managed_zone(dn):
@@ -326,6 +393,12 @@ class AdGateway:
         self._log_result(f"добавлена в группу {group_dn}", user_dn)
 
     def move_to_ou(self, dn: str, target_ou_dn: str) -> str:
+        """Переносит объект, подбирая свободный CN, если в целевой OU уже есть тёзка.
+
+        Та же ловушка, что и в `create_user`, только на пути реактивации: «Иван Петров» из
+        «Отчисленных» едет в OU направления, где такой CN уже занят другим Иваном Петровым, и AD
+        отвечает `entryAlreadyExists`. Переносим под CN с логином в скобках вместо падения.
+        """
         if not self.is_in_managed_zone(dn):
             raise OutsideManagedZoneError(dn)
         if _dn_equals(_parent_ou(dn), target_ou_dn):
@@ -333,15 +406,34 @@ class AdGateway:
             return dn
 
         rdn_attr, rdn_value, _ = parse_dn(dn)[0]
-        new_rdn = f"{rdn_attr}={escape_rdn(rdn_value)}"
+        username = self._read_sam_account_name(dn)
+        candidates = (
+            _cn_candidates(rdn_value, username) if username is not None else iter([rdn_value])
+        )
 
-        def op() -> bool:
-            return bool(self._connection.modify_dn(dn, new_rdn, new_superior=target_ou_dn))
+        for candidate_rdn_value in candidates:
+            new_rdn = f"{rdn_attr}={escape_rdn(candidate_rdn_value)}"
+            try:
+                self._run(partial(self._move, dn, new_rdn, target_ou_dn))
+            except LDAPEntryAlreadyExistsResult:
+                logger.warning(
+                    "CN %s в %s занят другой учётной записью, подбираю следующий вариант",
+                    candidate_rdn_value,
+                    target_ou_dn,
+                    extra={"event": "cn_collision"},
+                )
+                continue
+            new_dn = f"{new_rdn},{target_ou_dn}"
+            self._log_result(f"перенесена в {target_ou_dn}", new_dn)
+            return new_dn
 
-        self._run(op)
-        new_dn = f"{new_rdn},{target_ou_dn}"
-        self._log_result(f"перенесена в {target_ou_dn}", new_dn)
-        return new_dn
+        raise CnAllocationError(
+            f"не удалось подобрать свободный CN для переноса {dn} в {target_ou_dn} "
+            f"за {_MAX_CN_CANDIDATES} попыток"
+        )
+
+    def _move(self, dn: str, new_rdn: str, target_ou_dn: str) -> bool:
+        return bool(self._connection.modify_dn(dn, new_rdn, new_superior=target_ou_dn))
 
     def verify_zone_exists(self) -> None:
         missing = [dn for dn in self._config_dns if not self._dn_exists(dn)]
@@ -394,7 +486,7 @@ class AdGateway:
 
 
 def build_ldaps_connection(
-        *, host: str, port: int, ca_cert_path: Path, bind_dn: str, bind_password: str
+    *, host: str, port: int, ca_cert_path: Path, bind_dn: str, bind_password: str
 ) -> Connection:
     """Собирает боевое LDAPS-соединение с верификацией сертификата DC по `ca_cert_path`.
 

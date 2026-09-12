@@ -5,9 +5,14 @@ from datetime import UTC, datetime
 
 import pytest
 from ldap3 import BASE, MOCK_SYNC, Connection, Server
-from ldap3.core.exceptions import LDAPSocketOpenError
+from ldap3.core.exceptions import LDAPEntryAlreadyExistsResult, LDAPSocketOpenError
 
-from ad import AdGateway, ManagedZoneConfigError, OutsideManagedZoneError
+from ad import (
+    AdGateway,
+    CnAllocationError,
+    ManagedZoneConfigError,
+    OutsideManagedZoneError,
+)
 from config import SubjectConfig
 
 ADMIN_DN = "cn=admin,dc=fs,dc=loc"
@@ -293,3 +298,108 @@ def test_list_zone_accounts_covers_zone_and_fallback_excludes_disabled_and_outsi
     fallback_account = next(a for a in accounts if a.username == "fallback-user")
     assert fallback_account.enabled is False
     assert fallback_account.created_at == datetime(2021, 6, 5, 12, 0, 0, tzinfo=UTC)
+
+
+class _CollidingConnection:
+    """Прокси к `MOCK_SYNC`-соединению, заставляющий операцию ответить `entryAlreadyExists`.
+
+    Нужен, потому что `MOCK_SYNC` при `modify_dn` в занятый DN коллизию не эмулирует — просто
+    перетирает целевой объект, в отличие от боевого AD.
+    """
+
+    def __init__(self, connection: Connection, *, operation: str, times: int) -> None:
+        self._connection = connection
+        self._operation = operation
+        self._times = times
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._connection, name)
+
+    def _should_fail(self, operation: str) -> bool:
+        if operation != self._operation or self._times <= 0:
+            return False
+        self._times -= 1
+        return True
+
+    def add(self, *args: object, **kwargs: object) -> bool:
+        if self._should_fail("add"):
+            raise LDAPEntryAlreadyExistsResult(result=68, description="entryAlreadyExists")
+        return bool(self._connection.add(*args, **kwargs))
+
+    def modify_dn(self, *args: object, **kwargs: object) -> bool:
+        if self._should_fail("modify_dn"):
+            raise LDAPEntryAlreadyExistsResult(result=68, description="entryAlreadyExists")
+        return bool(self._connection.modify_dn(*args, **kwargs))
+
+
+def test_create_user_gives_namesake_a_separate_account() -> None:
+    """Тёзка в той же OU не должен приводить к захвату чужой учётки (CN-коллизия)."""
+    gateway = _make_gateway()
+    first_dn = gateway.create_user(
+        ou_dn=SUBJECT_OU, username="i.petrov", first="Иван", last="Петров"
+    )
+
+    second_dn = gateway.create_user(
+        ou_dn=SUBJECT_OU, username="i.petrov2", first="Иван", last="Петров"
+    )
+
+    assert second_dn != first_dn
+    assert "i.petrov2" in second_dn
+
+    namesake = gateway.find_user("i.petrov2")
+    assert namesake is not None
+    assert namesake.dn == second_dn
+
+    # Учётка первого тёзки осталась на месте и не была тронута.
+    original = gateway.find_user("i.petrov")
+    assert original is not None
+    assert original.dn == first_dn
+
+
+def test_create_user_logs_cn_collision(caplog: pytest.LogCaptureFixture) -> None:
+    gateway = _make_gateway()
+    gateway.create_user(ou_dn=SUBJECT_OU, username="i.petrov", first="Иван", last="Петров")
+
+    with caplog.at_level(logging.WARNING, logger="adsync.ad"):
+        gateway.create_user(ou_dn=SUBJECT_OU, username="i.petrov2", first="Иван", last="Петров")
+
+    assert "занят другой учётной записью" in caplog.text
+
+
+def test_create_user_raises_when_no_free_cn_left() -> None:
+    connection = _make_connection()
+    gateway = _make_gateway(_CollidingConnection(connection, operation="add", times=100))
+
+    with pytest.raises(CnAllocationError):
+        gateway.create_user(ou_dn=SUBJECT_OU, username="i.petrov", first="Иван", last="Петров")
+
+
+def test_move_to_ou_gives_namesake_a_separate_cn() -> None:
+    connection = _make_connection()
+    gateway = _make_gateway(connection)
+    dn = gateway.create_user(ou_dn=OU_DISABLED, username="i.petrov", first="Иван", last="Петров")
+
+    # В целевой OU уже живёт тёзка — первый modify_dn отвечает entryAlreadyExists.
+    gateway_with_collision = _make_gateway(
+        _CollidingConnection(connection, operation="modify_dn", times=1)
+    )
+    new_dn = gateway_with_collision.move_to_ou(dn, SUBJECT_OU)
+
+    # Состояние DIT после переноса здесь не проверяем: MOCK_SYNC при move игнорирует новый RDN и
+    # оставляет объекту старый — боевой AD применяет именно переданный. Контракт метода — вернуть
+    # DN, под которым объект действительно лежит в целевой OU.
+    assert new_dn.endswith(SUBJECT_OU)
+    assert new_dn.split(",")[0] == "CN=Иван Петров (i.petrov)"
+
+
+def test_move_to_ou_raises_when_no_free_cn_left() -> None:
+    connection = _make_connection()
+    gateway = _make_gateway(connection)
+    dn = gateway.create_user(ou_dn=OU_DISABLED, username="i.petrov", first="Иван", last="Петров")
+
+    gateway_with_collision = _make_gateway(
+        _CollidingConnection(connection, operation="modify_dn", times=100)
+    )
+
+    with pytest.raises(CnAllocationError):
+        gateway_with_collision.move_to_ou(dn, SUBJECT_OU)

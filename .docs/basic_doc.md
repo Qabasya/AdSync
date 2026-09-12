@@ -240,6 +240,7 @@ LDAP-идемпотентность в `ad.py`, отключённый access-л
 | `lms_active_logins_fetch_error` | ERROR (exception) | Не удалось получить список активных логинов из LMS для сверки | `reconcile.py` |
 | `reconcile_triggered_manually` | INFO | Администратор запустил сверку через `POST /reconcile`, не дожидаясь планового интервала | `api.py` |
 | `ad_reconnect` | WARNING | Соединение с AD потеряно, выполнено переподключение | `ad.py` |
+| `cn_collision` | WARNING | В целевой OU уже есть объект с таким CN, но с другим `sAMAccountName` (тёзка) — подбирается следующий вариант CN с логином в скобках | `ad.py` |
 | `service_started` | INFO | Сервис запущен (лог сразу после `configure_logging`) | `main.py` |
 | `service_stopped` | INFO | Сервис полностью остановился (конец `main()`, после закрытия клиентов) | `main.py` |
 | `shutdown_signal_received` | INFO | Получен SIGTERM/SIGINT, начат graceful shutdown | `main.py` |
