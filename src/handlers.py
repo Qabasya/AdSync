@@ -12,7 +12,7 @@ from typing import Literal, Protocol
 
 from ad import DirectoryGateway
 from config import SubjectConfig
-from models import DeprovisionJob, Job, PasswordJob, ProvisionJob
+from models import DeprovisionJob, Job, Outcome, PasswordJob, ProvisionJob
 
 logger = logging.getLogger("adsync.handlers")
 
@@ -23,6 +23,8 @@ class HandlerResult:
 
     status: Literal["done", "failed"]
     error: str | None = None
+    # Что именно сделано с учёткой (для журнала сайта); у `failed` — None.
+    outcome: Outcome | None = None
 
 
 class JobHandler(Protocol):
@@ -81,7 +83,7 @@ class ProvisionHandler:
                 target_ou,
                 extra={"event": "account_created"},
             )
-            return HandlerResult("done")
+            return HandlerResult("done", outcome="created")
 
         if self._directory.is_in_disabled_ou(existing.dn):
             self._directory.ensure_enabled(existing.dn)
@@ -97,7 +99,7 @@ class ProvisionHandler:
                 target_ou,
                 extra={"event": "account_reactivated"},
             )
-            return HandlerResult("done")
+            return HandlerResult("done", outcome="reactivated")
 
         if self._directory.is_in_managed_zone(existing.dn):
             self._directory.ensure_password(existing.dn, job.password)
@@ -111,7 +113,7 @@ class ProvisionHandler:
             logger.info(
                 "обновлена учётка %s в зоне", job.username, extra={"event": "account_updated"}
             )
-            return HandlerResult("done")
+            return HandlerResult("done", outcome="updated")
 
         logger.error(
             "provision %s: учётная запись вне управляемой зоны, объект не тронут",
@@ -138,7 +140,7 @@ class DeprovisionHandler:
                 job.username,
                 extra={"event": "account_deprovisioned"},
             )
-            return HandlerResult("done")
+            return HandlerResult("done", outcome="absent")
 
         if not self._directory.is_in_managed_zone(user.dn):
             logger.error(
@@ -160,7 +162,7 @@ class DeprovisionHandler:
             self._ou_disabled,
             extra={"event": "account_deprovisioned"},
         )
-        return HandlerResult("done")
+        return HandlerResult("done", outcome="deprovisioned")
 
 
 class PasswordHandler:
@@ -201,4 +203,4 @@ class PasswordHandler:
         logger.info(
             "смена пароля %s: пароль обновлён", job.username, extra={"event": "password_changed"}
         )
-        return HandlerResult("done")
+        return HandlerResult("done", outcome="password_changed")

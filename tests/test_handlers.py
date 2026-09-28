@@ -332,3 +332,32 @@ class TestAccountSettings:
         )
 
         assert dn not in directory.account_settings
+
+
+class TestOutcome:
+    """Итог для журнала сайта: что именно сделано с учёткой."""
+
+    def test_provision_outcomes(self) -> None:
+        directory = make_directory()
+        handler = ProvisionHandler(directory, subjects=SUBJECTS, ou_fallback=OU_FALLBACK)
+
+        assert handler.handle(provision_job()).outcome == "created"
+        assert handler.handle(provision_job()).outcome == "updated"
+        DeprovisionHandler(directory, ou_disabled=OU_DISABLED).handle(deprovision_job())
+        assert handler.handle(provision_job()).outcome == "reactivated"
+
+    def test_deprovision_outcomes(self) -> None:
+        directory = make_directory()
+        handler = DeprovisionHandler(directory, ou_disabled=OU_DISABLED)
+
+        assert handler.handle(deprovision_job()).outcome == "absent"
+        directory.create_user(ou_dn=OU_SUBJECT, username="ivanov", first="Иван", last="Иванов")
+        assert handler.handle(deprovision_job()).outcome == "deprovisioned"
+
+    def test_password_outcome_and_failure_has_none(self) -> None:
+        directory = make_directory()
+        handler = PasswordHandler(directory)
+
+        assert handler.handle(password_job()).outcome is None
+        directory.create_user(ou_dn=OU_SUBJECT, username="ivanov", first="Иван", last="Иванов")
+        assert handler.handle(password_job()).outcome == "password_changed"

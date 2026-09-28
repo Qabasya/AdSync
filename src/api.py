@@ -149,7 +149,7 @@ def create_public_api(
             )
 
         result = process_job(job)
-        return JobResultResponse(status=result.status, error=result.error)
+        return JobResultResponse(status=result.status, error=result.error, outcome=result.outcome)
 
     @app.post("/v1/reconcile", response_model=None)
     def reconcile(body: bytes = Depends(signed_body)) -> ReconcileResponse | JSONResponse:

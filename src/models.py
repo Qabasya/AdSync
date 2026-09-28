@@ -41,6 +41,12 @@ class PasswordJob(BaseModel):
     password: str
 
 
+# Что сделано с учёткой — сайт пишет это в журнал «Зачисления».
+# `absent` — deprovision, а учётки в домене нет (цель и так достигнута).
+Outcome = Literal[
+    "created", "reactivated", "updated", "deprovisioned", "absent", "password_changed"
+]
+
 Job = Annotated[ProvisionJob | DeprovisionJob | PasswordJob, Field(discriminator="event")]
 
 
@@ -53,6 +59,7 @@ class JobResultResponse(BaseModel):
 
     status: Literal["done", "failed"]
     error: str | None = None
+    outcome: Outcome | None = None
 
 
 class ReconcileRequest(BaseModel):

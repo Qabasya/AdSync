@@ -59,7 +59,7 @@ class PublicApi:
 
     def __init__(self) -> None:
         self.jobs: list[Job] = []
-        self.job_result = HandlerResult("done")
+        self.job_result = HandlerResult("done", outcome="created")
         self.reconcile_calls: list[tuple[list[str], bool]] = []
         self.reconcile_result = ReconcileResult(("x.stale",), aborted=False, applied=False)
         self.dc_down = False
@@ -116,7 +116,7 @@ def test_job_done_is_returned_synchronously() -> None:
     code, body = api.post("/v1/jobs", _PROVISION)
 
     assert code == 200
-    assert body == {"status": "done", "error": None}
+    assert body == {"status": "done", "error": None, "outcome": "created"}
     assert isinstance(api.jobs[0], ProvisionJob)
 
 
