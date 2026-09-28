@@ -1,6 +1,7 @@
-"""DTO модели контракта LMS: задания из ``GET /ad/jobs`` и тело ``POST /ad/ack``.
+"""DTO контракта с сайтом (push): задания `POST /v1/jobs` и сверка `POST /v1/reconcile`.
 
-Схемы и дискриминация по полю ``event`` описаны в ``.docs/FS_LMS_API.md`` §3.
+Сайт сам присылает задания; схемы и дискриминация по полю ``event`` описаны в
+``.docs/AdSyncPythonService.md`` §4.
 """
 
 from typing import Annotated, Literal
@@ -30,24 +31,41 @@ class DeprovisionJob(BaseModel):
     username: str
 
 
-Job = Annotated[ProvisionJob | DeprovisionJob, Field(discriminator="event")]
-
-
-class JobsResponse(BaseModel):
-    """Тело ответа ``GET /ad/jobs``."""
-
-    jobs: list[Job]
-
-
-class AckRequest(BaseModel):
-    """Тело запроса ``POST /ad/ack``. ``sam_account_name`` не отправляется — не используется WP."""
+class PasswordJob(BaseModel):
+    """Задание на смену пароля: администратор сменил пароль ученика на сайте."""
 
     id: int
+    event: Literal["password"]
+    idempotency_key: str
+    username: str
+    password: str
+
+
+Job = Annotated[ProvisionJob | DeprovisionJob | PasswordJob, Field(discriminator="event")]
+
+
+class JobResultResponse(BaseModel):
+    """Ответ на `POST /v1/jobs` — итог задания, синхронно.
+
+    `failed` — ошибка самого задания (сайт потратит попытку и повторит с бэкоффом);
+    недоступность DC отвечается не этим телом, а кодом `503`.
+    """
+
     status: Literal["done", "failed"]
     error: str | None = None
 
 
-class ActiveUsernamesResponse(BaseModel):
-    """Тело ответа ``GET /ad/active-usernames``."""
+class ReconcileRequest(BaseModel):
+    """Тело `POST /v1/reconcile`: кто должен остаться активным, и отключать ли остальных."""
 
     usernames: list[str]
+    apply: bool = False
+
+
+class ReconcileResponse(BaseModel):
+    """Ответ сверки. `disabled` — отключённые (при `apply: false` — кого отключили бы)."""
+
+    status: Literal["ok", "aborted"]
+    applied: bool
+    disabled: list[str]
+    abort_reason: str | None = None

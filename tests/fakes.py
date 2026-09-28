@@ -1,42 +1,10 @@
-"""In-memory фейки Protocol-интерфейсов для тестов (без сети, без реального AD)."""
+"""In-memory фейк `DirectoryGateway` для тестов (без сети, без реального AD)."""
 
 from datetime import UTC, datetime
 
-from ad import DirectoryUser, OutsideManagedZoneError, ZoneAccount
-from models import AckRequest, Job
+from ad import DirectoryUnavailableError, DirectoryUser, OutsideManagedZoneError, ZoneAccount
 
 _DEFAULT_CREATED_AT = datetime(2000, 1, 1, tzinfo=UTC)
-
-
-class FakeLmsApi:
-    """Реализация `LmsApi` в памяти: отдаёт заранее заданные задания, копит ack-и."""
-
-    def __init__(
-        self,
-        jobs: list[Job] | None = None,
-        active_usernames: list[str] | None = None,
-        *,
-        get_jobs_error: Exception | None = None,
-        ack_error: Exception | None = None,
-    ) -> None:
-        self.jobs: list[Job] = jobs if jobs is not None else []
-        self.active_usernames: list[str] = active_usernames if active_usernames is not None else []
-        self.acks: list[AckRequest] = []
-        self._get_jobs_error = get_jobs_error
-        self._ack_error = ack_error
-
-    def get_jobs(self, limit: int) -> list[Job]:
-        if self._get_jobs_error is not None:
-            raise self._get_jobs_error
-        return self.jobs[:limit]
-
-    def ack(self, request: AckRequest) -> None:
-        if self._ack_error is not None:
-            raise self._ack_error
-        self.acks.append(request)
-
-    def get_active_usernames(self) -> list[str]:
-        return self.active_usernames
 
 
 class FakeDirectoryGateway:
@@ -56,6 +24,15 @@ class FakeDirectoryGateway:
         self.group_members: dict[str, set[str]] = {}
         self.passwords: dict[str, str] = {}
         self.created_at: dict[str, datetime] = {}
+        # True — имитация недоступного DC: чтение из AD поднимает DirectoryUnavailableError.
+        self.unavailable = False
+
+    def _check_available(self) -> None:
+        if self.unavailable:
+            raise DirectoryUnavailableError("fake DC is down")
+
+    def ping(self) -> None:
+        self._check_available()
 
     def is_in_managed_zone(self, dn: str) -> bool:
         return any(dn.endswith(zone_dn) for zone_dn in self._zone_dns if zone_dn)
@@ -64,6 +41,7 @@ class FakeDirectoryGateway:
         return bool(self._ou_disabled) and dn.endswith(self._ou_disabled)
 
     def find_user(self, username: str) -> DirectoryUser | None:
+        self._check_available()
         return self.users_by_username.get(username)
 
     def create_user(
@@ -120,6 +98,7 @@ class FakeDirectoryGateway:
         return None
 
     def list_zone_accounts(self) -> list[ZoneAccount]:
+        self._check_available()
         return [
             ZoneAccount(
                 dn=user.dn,

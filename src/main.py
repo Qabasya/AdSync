@@ -1,10 +1,15 @@
-"""Composition root: `Settings` → зависимости → три daemon-потока (jobs/reconcile/heartbeat) +
-опциональный поток дневной сводки + `uvicorn` с локальным API. Graceful shutdown по SIGTERM/SIGINT.
+"""Composition root: `Settings` → зависимости → два `uvicorn` (публичный TLS-API для сайта и
+локальный healthcheck/статус) + daemon-поток heartbeat и опциональный поток дневной сводки.
+Graceful shutdown по SIGTERM/SIGINT.
+
+Push-модель: задания и сверку присылает сайт (`POST /v1/jobs`, `POST /v1/reconcile`), своих
+циклов опроса у сервиса нет.
 """
 
 import logging
 import signal
 import threading
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from types import FrameType
@@ -14,12 +19,19 @@ import uvicorn
 from ldap3 import Connection
 
 from ad import AdGateway, build_ldaps_connection
-from api import AppState, create_api
+from api import AppState, create_local_api, create_public_api
+from auth import SignatureVerifier
 from config import Settings, SubjectConfig, load_subjects
-from handlers import DeprovisionHandler, JobHandler, ProvisionHandler
-from lms import LmsClient
+from handlers import (
+    DeprovisionHandler,
+    HandlerResult,
+    JobHandler,
+    PasswordHandler,
+    ProvisionHandler,
+)
+from jobs import JobProcessor
 from logging_setup import configure_logging
-from poller import Poller
+from models import Job
 from reconcile import Reconciler, ReconcileResult
 from repository import JobRepository
 
@@ -33,8 +45,8 @@ def _now() -> datetime:
 def _build_ad_gateway(settings: Settings, subjects: dict[str, SubjectConfig]) -> AdGateway:
     """Собирает `AdGateway` с собственным LDAPS-соединением и `reconnect`-замыканием.
 
-    Вызывается дважды (для потока заданий и для потока сверки) — `ldap3.Connection` не
-    потокобезопасен для конкурентного использования, отдельные соединения проще и надёжнее
+    Вызывается трижды (задания, сверка, проверка связи): запросы сайта обрабатываются в пуле
+    потоков, а `ldap3.Connection` не потокобезопасен — отдельные соединения проще и надёжнее
     блокировок внутри `ad.py`.
     """
 
@@ -109,19 +121,31 @@ def _daily_summary_loop(
             )
 
 
+def _require_tls_files(settings: Settings) -> None:
+    """Fail fast: без сертификата публичный API не поднимется — лучше упасть на старте."""
+    missing = [
+        path for path in (settings.tls_cert_file, settings.tls_key_file) if not path.is_file()
+    ]
+    if missing:
+        raise SystemExit(
+            "не найдены файлы TLS публичного API: " + ", ".join(str(path) for path in missing)
+        )
+
+
 def main() -> None:
     settings = Settings()  # type: ignore[call-arg]
     configure_logging(data_dir=settings.data_dir, loki_url=settings.loki_url)
     logger.info("fs-adsync запускается", extra={"event": "service_started"})
     started_at = _now()
 
+    _require_tls_files(settings)
     subjects = load_subjects(settings.subjects_file)
 
     jobs_directory = _build_ad_gateway(settings, subjects)
     reconcile_directory = _build_ad_gateway(settings, subjects)
+    health_directory = _build_ad_gateway(settings, subjects)
     jobs_directory.verify_zone_exists()
 
-    lms = LmsClient(settings.lms_base_url, settings.fs_lms_ad_hmac_secret)
     repository = JobRepository(settings.data_dir / "state.db")
 
     handlers: dict[str, JobHandler] = {
@@ -129,17 +153,11 @@ def main() -> None:
             jobs_directory, subjects=subjects, ou_fallback=settings.ad_ou_fallback
         ),
         "deprovision": DeprovisionHandler(jobs_directory, ou_disabled=settings.ad_ou_disabled),
+        "password": PasswordHandler(jobs_directory),
     }
 
-    poller = Poller(
-        lms,
-        handlers=handlers,
-        repository=repository,
-        jobs_limit=settings.jobs_limit,
-        now=_now,
-    )
+    processor = JobProcessor(handlers=handlers, repository=repository, now=_now)
     reconciler = Reconciler(
-        lms,
         reconcile_directory,
         ou_disabled=settings.ad_ou_disabled,
         max_disable=settings.reconcile_max_disable,
@@ -147,20 +165,29 @@ def main() -> None:
         grace_minutes=settings.reconcile_grace_minutes,
         now=_now,
     )
+    verifier = SignatureVerifier(
+        settings.fs_lms_ad_hmac_secret,
+        max_skew_seconds=settings.hmac_max_skew_seconds,
+        now=time.time,
+    )
 
     state = AppState()
-    reconcile_lock = threading.Lock()
+    health_lock = threading.Lock()
     stop = threading.Event()
 
-    def run_jobs_tick() -> None:
-        poller.run_once()
-        state.last_jobs_poll_at = _now()
+    def process_job(job: Job) -> HandlerResult:
+        result = processor.process(job)
+        state.last_job_at = _now()
+        return result
 
-    def run_reconcile_tick() -> ReconcileResult:
-        with reconcile_lock:
-            result = reconciler.run_once()
-            state.last_reconcile_at = _now()
-            return result
+    def run_reconcile(usernames: list[str], apply: bool) -> ReconcileResult:
+        result = reconciler.run(usernames, apply=apply)
+        state.last_reconcile_at = _now()
+        return result
+
+    def check_directory() -> None:
+        with health_lock:
+            health_directory.ping()
 
     def run_heartbeat_tick() -> None:
         counts = repository.status_counts()
@@ -175,18 +202,6 @@ def main() -> None:
         )
 
     threads = [
-        threading.Thread(
-            target=_loop,
-            args=(stop, settings.jobs_poll_seconds, run_jobs_tick, "заданий"),
-            name="jobs",
-            daemon=True,
-        ),
-        threading.Thread(
-            target=_loop,
-            args=(stop, settings.reconcile_interval_hours * 3600, run_reconcile_tick, "сверки"),
-            name="reconcile",
-            daemon=True,
-        ),
         threading.Thread(
             target=_loop,
             args=(stop, settings.heartbeat_interval_seconds, run_heartbeat_tick, "heartbeat"),
@@ -206,14 +221,42 @@ def main() -> None:
     for thread in threads:
         thread.start()
 
-    app = create_api(state=state, repository=repository, run_reconcile=run_reconcile_tick)
-    server = uvicorn.Server(
-        uvicorn.Config(app, host="0.0.0.0", port=settings.api_port, log_config=None)
+    public_app = create_public_api(
+        verifier=verifier,
+        process_job=process_job,
+        run_reconcile=run_reconcile,
+        check_directory=check_directory,
     )
+    local_app = create_local_api(state=state, repository=repository)
+    servers = [
+        uvicorn.Server(
+            uvicorn.Config(
+                public_app,
+                host="0.0.0.0",
+                port=settings.public_port,
+                ssl_certfile=str(settings.tls_cert_file),
+                ssl_keyfile=str(settings.tls_key_file),
+                log_config=None,
+            )
+        ),
+        uvicorn.Server(
+            uvicorn.Config(local_app, host="0.0.0.0", port=settings.api_port, log_config=None)
+        ),
+    ]
     # uvicorn пропускает установку своих обработчиков сигналов, если запущен не из главного
     # потока — сигналами управляет только main(), без конфликта.
-    api_thread = threading.Thread(target=server.run, name="api", daemon=True)
-    api_thread.start()
+    server_threads = [
+        threading.Thread(target=server.run, name=name, daemon=True)
+        for server, name in zip(servers, ("api-public", "api-local"), strict=True)
+    ]
+    for thread in server_threads:
+        thread.start()
+    logger.info(
+        "публичный API слушает :%d (TLS), локальный — :%d",
+        settings.public_port,
+        settings.api_port,
+        extra={"event": "api_started"},
+    )
 
     def handle_signal(signum: int, _frame: FrameType | None) -> None:
         logger.info(
@@ -222,20 +265,20 @@ def main() -> None:
             extra={"event": "shutdown_signal_received"},
         )
         stop.set()
-        server.should_exit = True
+        for server in servers:
+            server.should_exit = True
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
     stop.wait()
-    for thread in threads:
+    for thread in threads + server_threads:
         thread.join(timeout=10)
-    api_thread.join(timeout=10)
 
-    lms.close()
     repository.close()
     jobs_directory.close()
     reconcile_directory.close()
+    health_directory.close()
     logger.info("fs-adsync остановлен", extra={"event": "service_stopped"})
 
 

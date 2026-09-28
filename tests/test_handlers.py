@@ -7,8 +7,8 @@ from fakes import FakeDirectoryGateway
 
 from ad import DirectoryUser
 from config import SubjectConfig
-from handlers import DeprovisionHandler, ProvisionHandler
-from models import DeprovisionJob, ProvisionJob
+from handlers import DeprovisionHandler, PasswordHandler, ProvisionHandler
+from models import DeprovisionJob, PasswordJob, ProvisionJob
 
 OU_SUBJECT = "OU=KEGE,OU=Ученики,DC=fs,DC=loc"
 GROUP_SUBJECT = "CN=KEGE,OU=Группы,DC=fs,DC=loc"
@@ -215,3 +215,59 @@ class TestDeprovisionHandler:
         user = directory.users_by_username["ivanov"]
         assert user.dn == dn
         assert user.enabled is True
+
+
+def password_job(**overrides: object) -> PasswordJob:
+    payload: dict[str, object] = {
+        "id": 3,
+        "event": "password",
+        "idempotency_key": "password:person:42:1",
+        "username": "ivanov",
+        "password": "n3w-secret",
+    }
+    payload.update(overrides)
+    return PasswordJob.model_validate(payload)
+
+
+class TestPasswordHandler:
+    def test_active_user_gets_new_password(self, caplog: pytest.LogCaptureFixture) -> None:
+        directory = make_directory()
+        dn = directory.create_user(ou_dn=OU_SUBJECT, username="ivanov", first="Иван", last="Иванов")
+        directory.ensure_enabled(dn)
+
+        with caplog.at_level(logging.INFO, logger="adsync.handlers"):
+            result = PasswordHandler(directory).handle(password_job())
+
+        assert result.status == "done"
+        assert directory.passwords[dn] == "n3w-secret"
+        assert directory.users_by_username["ivanov"].enabled is True
+        assert "n3w-secret" not in caplog.text
+
+    def test_disabled_user_gets_password_but_stays_disabled(self) -> None:
+        """Пароль — не повод включать: учётку в «Отчисленных» возвращает только provision."""
+        directory = make_directory()
+        dn = directory.create_user(
+            ou_dn=OU_DISABLED, username="ivanov", first="Иван", last="Иванов"
+        )
+
+        result = PasswordHandler(directory).handle(password_job())
+
+        assert result.status == "done"
+        assert directory.passwords[dn] == "n3w-secret"
+        assert directory.users_by_username["ivanov"].enabled is False
+        assert directory.users_by_username["ivanov"].dn == dn
+
+    def test_missing_user_fails(self) -> None:
+        result = PasswordHandler(make_directory()).handle(password_job())
+
+        assert result.status == "failed"
+        assert result.error == "учётки нет в домене"
+
+    def test_user_outside_zone_fails_without_touching(self) -> None:
+        directory = make_directory()
+        dn = directory.create_user(ou_dn=OU_OUTSIDE, username="ivanov", first="Иван", last="Иванов")
+
+        result = PasswordHandler(directory).handle(password_job())
+
+        assert result.status == "failed"
+        assert dn not in directory.passwords

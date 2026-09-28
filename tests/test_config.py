@@ -8,7 +8,6 @@ from pydantic import ValidationError
 from config import Settings, SubjectsConfigError, load_subjects
 
 REQUIRED_ENV = {
-    "LMS_BASE_URL": "https://example.com/wp-json/fs-lms/v1",
     "FS_LMS_AD_HMAC_SECRET": "secret",
     "LDAP_BIND_DN": "CN=svc-adsync,OU=Service,DC=fs,DC=loc",
     "LDAP_BIND_PASSWORD": "bind-password",
@@ -27,9 +26,10 @@ def test_settings_loads_from_env_with_defaults(monkeypatch: pytest.MonkeyPatch) 
 
     settings = Settings(_env_file=None)  # type: ignore[call-arg]
 
-    assert settings.lms_base_url == REQUIRED_ENV["LMS_BASE_URL"]
-    assert settings.jobs_poll_seconds == 3
-    assert settings.jobs_limit == 50
+    assert settings.public_port == 8443
+    assert settings.tls_cert_file == Path("/app/config/tls/server.crt")
+    assert settings.tls_key_file == Path("/app/config/tls/server.key")
+    assert settings.hmac_max_skew_seconds == 300
     assert settings.ldap_host == "11.11.11.11"
     assert settings.ldap_port == 636
     assert settings.data_dir == Path("/data")
@@ -40,18 +40,27 @@ def test_settings_loads_from_env_with_defaults(monkeypatch: pytest.MonkeyPatch) 
 
 def test_settings_overrides_defaults_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     _set_required_env(monkeypatch)
-    monkeypatch.setenv("JOBS_POLL_SECONDS", "5")
+    monkeypatch.setenv("PUBLIC_PORT", "443")
     monkeypatch.setenv("API_PORT", "9000")
 
     settings = Settings(_env_file=None)  # type: ignore[call-arg]
 
-    assert settings.jobs_poll_seconds == 5
+    assert settings.public_port == 443
     assert settings.api_port == 9000
 
 
 def test_settings_rejects_non_positive_heartbeat_interval(monkeypatch: pytest.MonkeyPatch) -> None:
     _set_required_env(monkeypatch)
     monkeypatch.setenv("HEARTBEAT_INTERVAL_SECONDS", "0")
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)  # type: ignore[call-arg]
+
+
+def test_settings_rejects_empty_hmac_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Пустой секрет = любой запрос отклоняется подписью; лучше упасть на старте."""
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("FS_LMS_AD_HMAC_SECRET", "")
 
     with pytest.raises(ValidationError):
         Settings(_env_file=None)  # type: ignore[call-arg]

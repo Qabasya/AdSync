@@ -1,36 +1,41 @@
-"""Сверка активных учёток управляемой зоны со списком от LMS — с предохранителями.
+"""Сверка активных учёток управляемой зоны со списком от сайта — с предохранителями.
 
-Односторонняя: только отключает лишних (по пути `DeprovisionHandler`), никого не включает,
-не создаёт и не переносит обратно. Про журнал заданий не знает — сверка не привязана к
-`job_id`/`idempotency_key` WP, это не обработка задания.
+Push-модель: сайт раз в сутки присылает `POST /v1/reconcile` со списком логинов, которые
+должны остаться активными, и флагом `apply`. Без `apply` сверка только пишет в журнал, кого
+отключила бы (режим первой недели). Односторонняя: только отключает лишних (по пути
+`DeprovisionHandler`), никого не включает, не создаёт и не переносит обратно. Про журнал
+заданий не знает — сверка не привязана к `job_id`/`idempotency_key`, это не обработка задания.
 """
 
 import logging
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from ad import DirectoryGateway
-from lms import LmsApi, LmsModuleUnavailableError
 
 logger = logging.getLogger("adsync.reconcile")
 
 
 @dataclass(frozen=True, slots=True)
 class ReconcileResult:
-    """Итог одного прогона сверки."""
+    """Итог одного прогона сверки.
+
+    При `applied=False` (режим «только журнал») в `disabled_usernames` — кого отключила бы.
+    """
 
     disabled_usernames: tuple[str, ...]
     aborted: bool
+    applied: bool = False
     abort_reason: str | None = None
 
 
 class Reconciler:
-    """Сверяет активные учётки управляемой зоны со списком от LMS."""
+    """Сверяет активные учётки управляемой зоны со списком от сайта."""
 
     def __init__(
         self,
-        lms: LmsApi,
         directory: DirectoryGateway,
         *,
         ou_disabled: str,
@@ -42,7 +47,6 @@ class Reconciler:
         """Собирает сверку из готовых зависимостей.
 
         Args:
-            lms: клиент LMS (`get_active_usernames`).
             directory: шлюз AD (`list_zone_accounts`/`ensure_disabled`/`move_to_ou`).
             ou_disabled: DN OU «Отчисленные» — куда переносятся отключённые учётки.
             max_disable: порог `RECONCILE_MAX_DISABLE`.
@@ -50,41 +54,34 @@ class Reconciler:
             grace_minutes: `RECONCILE_GRACE_MINUTES` — свежие учётки не трогаются.
             now: источник текущего времени (UTC) — внедряется для тестируемости.
         """
-        self._lms = lms
         self._directory = directory
         self._ou_disabled = ou_disabled
         self._max_disable = max_disable
         self._max_disable_pct = max_disable_pct
         self._grace_minutes = grace_minutes
         self._now = now
+        # Своё LDAP-соединение; два запроса сверки подряд не должны делить его одновременно.
+        self._lock = threading.Lock()
 
-    def run_once(self) -> ReconcileResult:
-        """Один прогон сверки. Ошибка предохранителя — abort, никто не тронут."""
+    def run(self, active_usernames: list[str], *, apply: bool) -> ReconcileResult:
+        """Один прогон сверки. Нарушен предохранитель — abort, никто не тронут.
+
+        Args:
+            active_usernames: логины, которые должны остаться активными (от сайта).
+            apply: `True` — отключать лишних; `False` — только журнал.
+
+        Raises:
+            DirectoryUnavailableError: DC недоступен — сайт повторит сверку в следующий раз.
+        """
+        with self._lock:
+            return self._run(set(active_usernames), apply=apply)
+
+    def _run(self, active_usernames: set[str], *, apply: bool) -> ReconcileResult:
         zone_accounts = self._directory.list_zone_accounts()
-
-        try:
-            active_usernames = set(self._lms.get_active_usernames())
-        except LmsModuleUnavailableError as exc:
-            # Не предохранитель и не сбой: сверять не с чем, пока модуль на сайте выключен —
-            # WARNING без traceback, чтобы не поднимать ложную тревогу по `level="error"`.
-            logger.warning(
-                "сверка пропущена: синхронизация с доменом на стороне LMS выключена (%s)",
-                exc,
-                extra={"event": "lms_module_unavailable"},
-            )
-            return ReconcileResult(
-                (), aborted=True, abort_reason="синхронизация с доменом на стороне LMS выключена"
-            )
-        except Exception:
-            logger.exception(
-                "не удалось получить список активных логинов из LMS",
-                extra={"event": "lms_active_logins_fetch_error"},
-            )
-            return self._abort("сбой получения списка от LMS")
 
         if not active_usernames and zone_accounts:
             return self._abort(
-                "пустой список активных логинов от LMS при непустой управляемой зоне"
+                "пустой список активных логинов от сайта при непустой управляемой зоне", apply
             )
 
         grace_cutoff = self._now() - timedelta(minutes=self._grace_minutes)
@@ -95,12 +92,27 @@ class Reconciler:
         ]
 
         if len(stale) > self._max_disable:
-            return self._abort(f"к отключению {len(stale)} учёток, порог {self._max_disable}")
+            return self._abort(
+                f"к отключению {len(stale)} учёток, порог {self._max_disable}", apply
+            )
 
         if len(stale) * 100 > self._max_disable_pct * len(zone_accounts):
             return self._abort(
                 f"к отключению {len(stale)} из {len(zone_accounts)} "
-                f"(порог {self._max_disable_pct}% зоны)"
+                f"(порог {self._max_disable_pct}% зоны)",
+                apply,
+            )
+
+        if not apply:
+            logger.info(
+                "сверка (только журнал): отключила бы %d из %d учёток зоны: %s",
+                len(stale),
+                len(zone_accounts),
+                ", ".join(account.username for account in stale) or "никого",
+                extra={"event": "reconcile_dry_run"},
+            )
+            return ReconcileResult(
+                tuple(account.username for account in stale), aborted=False, applied=False
             )
 
         disabled: list[str] = []
@@ -115,8 +127,8 @@ class Reconciler:
             len(zone_accounts),
             extra={"event": "reconcile_done"},
         )
-        return ReconcileResult(tuple(disabled), aborted=False)
+        return ReconcileResult(tuple(disabled), aborted=False, applied=True)
 
-    def _abort(self, reason: str) -> ReconcileResult:
+    def _abort(self, reason: str, apply: bool) -> ReconcileResult:
         logger.error("Сверка отменена: %s", reason, extra={"event": "reconcile_aborted"})
-        return ReconcileResult((), aborted=True, abort_reason=reason)
+        return ReconcileResult((), aborted=True, applied=apply, abort_reason=reason)
