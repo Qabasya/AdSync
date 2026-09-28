@@ -66,6 +66,8 @@ def _build_ad_gateway(settings: Settings, subjects: dict[str, SubjectConfig]) ->
         ou_disabled=settings.ad_ou_disabled,
         ou_fallback=settings.ad_ou_fallback,
         upn_suffix=settings.ad_upn_suffix,
+        password_never_expires=settings.ad_password_never_expires,
+        profile_path_template=settings.ad_profile_path_template,
     )
 
 

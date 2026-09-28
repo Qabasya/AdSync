@@ -125,7 +125,7 @@ class DirectoryGateway(Protocol):
 - **Подпись**: `FS_LMS_AD_HMAC_SECRET` (совпадает с `wp-config.php` плагина), `HMAC_MAX_SKEW_SECONDS`.
 - **Публичный API**: `PUBLIC_PORT` (8443), `TLS_CERT_FILE`, `TLS_KEY_FILE`.
 - **Сверка**: `RECONCILE_GRACE_MINUTES`, `RECONCILE_MAX_DISABLE`, `RECONCILE_MAX_DISABLE_PCT` — предохранители против массового отключения по сбойным данным; когда и в каком режиме сверять, решает сайт.
-- **AD**: `LDAP_HOST`, `LDAP_PORT` (только LDAPS), `LDAP_CA_CERT`, `LDAP_BIND_DN`/`LDAP_BIND_PASSWORD` (сервис-аккаунт), `AD_UPN_SUFFIX`, `AD_OU_DISABLED`, `AD_OU_FALLBACK`, `SUBJECTS_FILE`.
+- **AD**: `LDAP_HOST`, `LDAP_PORT` (только LDAPS), `LDAP_CA_CERT`, `LDAP_BIND_DN`/`LDAP_BIND_PASSWORD` (сервис-аккаунт), `AD_UPN_SUFFIX`, `AD_OU_DISABLED`, `AD_OU_FALLBACK`, `SUBJECTS_FILE`, `AD_PROFILE_PATH_TEMPLATE` (путь профиля с `{username}`, в `.env` — в одинарных кавычках), `AD_PASSWORD_NEVER_EXPIRES` (`true`).
 - **Рантайм**: `DATA_DIR` (`state.db` + логи), `TZ_NAME`, `DAILY_SUMMARY_TIME` (пусто = сводка выключена).
 - **Опция**: `LOKI_URL`.
 - **Локальный API**: `API_PORT` (по умолчанию 8091 — 8090 занят `fs-video-uploader`, не путать).

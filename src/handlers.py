@@ -74,6 +74,7 @@ class ProvisionHandler:
             self._directory.ensure_enabled(dn)
             if target_group is not None:
                 self._directory.ensure_group_membership(dn, target_group)
+            self._directory.ensure_account_settings(dn, job.username)
             logger.info(
                 "создана учётка %s в %s",
                 job.username,
@@ -88,6 +89,7 @@ class ProvisionHandler:
             self._directory.ensure_password(new_dn, job.password)
             if target_group is not None:
                 self._directory.ensure_group_membership(new_dn, target_group)
+            self._directory.ensure_account_settings(new_dn, job.username)
             logger.info(
                 "реактивирована учётка %s: %s → %s",
                 job.username,
@@ -105,6 +107,7 @@ class ProvisionHandler:
             self._directory.ensure_enabled(existing.dn)
             if target_group is not None:
                 self._directory.ensure_group_membership(existing.dn, target_group)
+            self._directory.ensure_account_settings(existing.dn, job.username)
             logger.info(
                 "обновлена учётка %s в зоне", job.username, extra={"event": "account_updated"}
             )
@@ -145,18 +148,14 @@ class DeprovisionHandler:
             )
             return HandlerResult("failed", error="учётная запись вне управляемой зоны")
 
-        if not user.enabled:
-            logger.info(
-                "deprovision %s: уже отключена",
-                job.username,
-                extra={"event": "account_deprovisioned"},
-            )
-            return HandlerResult("done")
-
-        self._directory.ensure_disabled(user.dn)
-        self._directory.move_to_ou(user.dn, self._ou_disabled)
+        # Цель — оба условия сразу: отключена И лежит в «Отчисленных». Приводим каждое
+        # отдельно — учётку могли вручную включить обратно или перенести, не отключив.
+        if user.enabled:
+            self._directory.ensure_disabled(user.dn)
+        if not self._directory.is_in_disabled_ou(user.dn):
+            self._directory.move_to_ou(user.dn, self._ou_disabled)
         logger.info(
-            "deprovision %s: отключена и перенесена в %s",
+            "deprovision %s: отключена, в %s",
             job.username,
             self._ou_disabled,
             extra={"event": "account_deprovisioned"},
@@ -196,6 +195,9 @@ class PasswordHandler:
             return HandlerResult("failed", error="учётная запись вне управляемой зоны")
 
         self._directory.ensure_password(user.dn, job.password)
+        # Заодно — путь к профилю и «пароль без срока»: так приводятся учётки, созданные
+        # до появления этих настроек (достаточно сменить пароль на сайте).
+        self._directory.ensure_account_settings(user.dn, job.username)
         logger.info(
             "смена пароля %s: пароль обновлён", job.username, extra={"event": "password_changed"}
         )

@@ -119,3 +119,29 @@ def test_load_subjects_malformed_schema_raises(tmp_path: Path) -> None:
 
     with pytest.raises(SubjectsConfigError):
         load_subjects(path)
+
+
+def test_profile_template_and_password_policy_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_required_env(monkeypatch)
+
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+
+    assert settings.ad_password_never_expires is True
+    assert settings.ad_profile_path_template is None
+
+
+def test_profile_template_is_read_literally(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("AD_PROFILE_PATH_TEMPLATE", r"\\dc.fs.loc\Profiles$\{username}\profile")
+
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+
+    assert settings.ad_profile_path_template == r"\\dc.fs.loc\Profiles$\{username}\profile"
+
+
+def test_profile_template_without_username_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_required_env(monkeypatch)
+    monkeypatch.setenv("AD_PROFILE_PATH_TEMPLATE", r"\\dc.fs.loc\Profiles$\common")
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)  # type: ignore[call-arg]

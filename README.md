@@ -113,6 +113,9 @@ uv run python src/main.py
 - **`LDAP_HOST` / `LDAP_BIND_DN` / `LDAP_BIND_PASSWORD` / `LDAP_CA_CERT`** — доступ к домен-контроллеру по LDAPS (сертификат обязателен, отключать проверку нельзя).
 - **`SUBJECTS_FILE`** — `subjects.yaml`, маппинг «направление → OU + группа в AD» (пример в `config/subjects.yaml.example`). `subject_key`, которого нет в файле, не роняет обработку — уйдёт в fallback-OU.
 - **`AD_OU_DISABLED` / `AD_OU_FALLBACK`** — DN OU «Отчисленные» и «Без направления».
+- **`AD_PROFILE_PATH_TEMPLATE`** — путь к перемещаемому профилю, `{username}` — логин (например `'\\dc.fs.loc\Profiles$\{username}\profile'`, **в одинарных кавычках** — иначе compose подставит переменную вместо `$`). Пусто — поле профиля не трогается.
+- **`AD_PASSWORD_NEVER_EXPIRES`** — галка «Срок действия пароля не ограничен» (по умолчанию `true`).
+  Обе настройки приводятся при создании, повторном зачислении, обновлении учётки и смене пароля — старые учётки догоняются сменой пароля на сайте.
 - **`RECONCILE_MAX_DISABLE` / `RECONCILE_MAX_DISABLE_PCT` / `RECONCILE_GRACE_MINUTES`** — предохранители сверки (режим «только журнал» / «отключать» выбирается на сайте).
 - **`LOKI_URL`** — если задан, логи параллельно улетают в Grafana Loki. Это основной канал наблюдаемости — телеграм-уведомлений сервис сам не шлёт, для этого будет Grafana Alerting поверх Loki (как и у `fs-video-uploader`).
 

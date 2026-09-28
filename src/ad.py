@@ -32,6 +32,8 @@ logger = logging.getLogger("adsync.ad")
 _ACCOUNT_ENABLED = 512
 _ACCOUNT_DISABLED = 514
 _ACCOUNTDISABLE_BIT = 0x2
+# Галка «Срок действия пароля не ограничен» (ADS_UF_DONT_EXPIRE_PASSWD).
+_DONT_EXPIRE_PASSWORD = 0x10000
 _USER_OBJECT_CLASSES = ["top", "person", "organizationalPerson", "user"]
 
 T = TypeVar("T")
@@ -186,6 +188,10 @@ class DirectoryGateway(Protocol):
         """Стартовая проверка: все DN конфигурации существуют в AD, иначе понятная ошибка."""
         ...
 
+    def ensure_account_settings(self, dn: str, username: str) -> None:
+        """Путь к профилю и «пароль без срока» по конфигурации. Включённость не меняет."""
+        ...
+
     def ping(self) -> None:
         """Лёгкая проверка связи с DC; недоступен — `DirectoryUnavailableError`."""
         ...
@@ -207,6 +213,8 @@ class AdGateway:
         ou_disabled: str,
         ou_fallback: str,
         upn_suffix: str,
+        password_never_expires: bool = False,
+        profile_path_template: str | None = None,
     ) -> None:
         """Создаёт шлюз поверх уже установленного соединения.
 
@@ -218,12 +226,18 @@ class AdGateway:
             ou_disabled: DN OU «Отчисленные».
             ou_fallback: DN OU «Без направления».
             upn_suffix: домен после `@` в UPN; источник корня поиска (`fs.loc` → `DC=fs,DC=loc`).
+            password_never_expires: ставить галку «Срок действия пароля не ограничен»;
+                сохраняется и при включении, и при отключении учётки.
+            profile_path_template: путь к перемещаемому профилю, `{username}` — логин
+                (`\\\\dc.fs.loc\\Profiles$\\{username}\\profile`); `None` — атрибут не трогается.
         """
         self._connection = connection
         self._reconnect = reconnect
         self._ou_disabled = ou_disabled
         self._ou_fallback = ou_fallback
         self._upn_suffix = upn_suffix
+        self._uac_extra = _DONT_EXPIRE_PASSWORD if password_never_expires else 0
+        self._profile_path_template = profile_path_template
         self._zone_dns = [subject.ou_dn for subject in subjects.values()] + [
             ou_disabled,
             ou_fallback,
@@ -312,7 +326,7 @@ class AdGateway:
             "displayName": display_name,
             # Создаём ОТКЛЮЧЁННОЙ: AD отклоняет add() сразу включённой учётки без пароля
             # (WILL_NOT_PERFORM/5003). Включение — отдельным шагом, после ensure_password.
-            "userAccountControl": _ACCOUNT_DISABLED,
+            "userAccountControl": _ACCOUNT_DISABLED | self._uac_extra,
         }
 
         for candidate_cn in _cn_candidates(display_name, username):
@@ -376,10 +390,48 @@ class AdGateway:
         self._log_result("пароль установлен", dn)
 
     def ensure_enabled(self, dn: str) -> None:
-        self._set_account_control(dn, _ACCOUNT_ENABLED, action="учётная запись включена")
+        self._set_account_control(
+            dn, _ACCOUNT_ENABLED | self._uac_extra, action="учётная запись включена"
+        )
 
     def ensure_disabled(self, dn: str) -> None:
-        self._set_account_control(dn, _ACCOUNT_DISABLED, action="учётная запись отключена")
+        self._set_account_control(
+            dn, _ACCOUNT_DISABLED | self._uac_extra, action="учётная запись отключена"
+        )
+
+    def ensure_account_settings(self, dn: str, username: str) -> None:
+        if not self.is_in_managed_zone(dn):
+            raise OutsideManagedZoneError(dn)
+
+        changes: dict[str, list[tuple[str, list[object]]]] = {}
+        if self._profile_path_template:
+            profile_path = self._profile_path_template.format(username=username)
+            changes["profilePath"] = [(MODIFY_REPLACE, [profile_path])]
+        if self._uac_extra:
+            # Только добавляем бит, сохраняя «включена/отключена» как есть.
+            uac = self._read_account_control(dn)
+            if uac is not None and not uac & self._uac_extra:
+                changes["userAccountControl"] = [(MODIFY_REPLACE, [uac | self._uac_extra])]
+        if not changes:
+            return
+
+        def op() -> bool:
+            return bool(self._connection.modify(dn, changes))
+
+        self._run(op)
+        self._log_result("профиль и срок пароля приведены к настройкам", dn)
+
+    def _read_account_control(self, dn: str) -> int | None:
+        def op() -> bool:
+            return bool(
+                self._connection.search(
+                    dn, "(objectClass=user)", BASE, attributes=["userAccountControl"]
+                )
+            )
+
+        self._run(op)
+        entries = self._connection.entries
+        return int(entries[0]["userAccountControl"].value) if entries else None
 
     def _set_account_control(self, dn: str, value: int, *, action: str) -> None:
         if not self.is_in_managed_zone(dn):

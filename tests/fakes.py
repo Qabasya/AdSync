@@ -26,6 +26,8 @@ class FakeDirectoryGateway:
         self.created_at: dict[str, datetime] = {}
         # True — имитация недоступного DC: чтение из AD поднимает DirectoryUnavailableError.
         self.unavailable = False
+        # DN → логин, для которого приводились профиль и срок пароля (ensure_account_settings).
+        self.account_settings: dict[str, str] = {}
 
     def _check_available(self) -> None:
         if self.unavailable:
@@ -64,6 +66,11 @@ class FakeDirectoryGateway:
         if not self.is_in_managed_zone(dn):
             raise OutsideManagedZoneError(dn)
         self.passwords[dn] = password
+
+    def ensure_account_settings(self, dn: str, username: str) -> None:
+        if not self.is_in_managed_zone(dn):
+            raise OutsideManagedZoneError(dn)
+        self.account_settings[dn] = username
 
     def ensure_enabled(self, dn: str) -> None:
         self._set_enabled(dn, enabled=True)
