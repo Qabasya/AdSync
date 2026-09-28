@@ -4,9 +4,9 @@ import logging
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from fakes import FakeDirectoryGateway, FakeLmsApi
+from fakes import FakeDirectoryGateway
 
-from lms import LmsModuleUnavailableError
+from ad import DirectoryUnavailableError
 from reconcile import Reconciler
 
 OU_SUBJECT = "OU=KEGE,OU=Ученики,DC=fs,DC=loc"
@@ -15,20 +15,6 @@ OU_FALLBACK = "OU=Без направления,DC=fs,DC=loc"
 
 _NOW = datetime(2026, 7, 20, 10, 0, 0, tzinfo=UTC)
 _OLD = datetime(2000, 1, 1, tzinfo=UTC)
-
-
-class FailingLmsApi(FakeLmsApi):
-    """Фейк LMS, у которого `get_active_usernames` всегда падает с сетевой ошибкой."""
-
-    def get_active_usernames(self) -> list[str]:
-        raise RuntimeError("network down")
-
-
-class ModuleDisabledLmsApi(FakeLmsApi):
-    """Фейк LMS с выключенным на сайте модулем AdSync: эндпоинт отвечает 404."""
-
-    def get_active_usernames(self) -> list[str]:
-        raise LmsModuleUnavailableError("GET /ad/active-usernames → 404")
 
 
 def make_directory() -> FakeDirectoryGateway:
@@ -57,14 +43,12 @@ def seed_active_account(
 
 def make_reconciler(
     directory: FakeDirectoryGateway,
-    lms: FakeLmsApi,
     *,
     max_disable: int = 10,
     max_disable_pct: int = 100,
     grace_minutes: int = 15,
 ) -> Reconciler:
     return Reconciler(
-        lms,
         directory,
         ou_disabled=OU_DISABLED,
         max_disable=max_disable,
@@ -87,11 +71,11 @@ def test_disables_only_accounts_missing_from_active_list(
     seed_active_account(
         directory, ou_dn=OU_SUBJECT, username="c", first="C", last="C", created_at=_OLD
     )
-    lms = FakeLmsApi(active_usernames=["a", "b"])
-    reconciler = make_reconciler(directory, lms)
+    active = ["a", "b"]
+    reconciler = make_reconciler(directory)
 
     with caplog.at_level(logging.INFO, logger="adsync.reconcile"):
-        result = reconciler.run_once()
+        result = reconciler.run(active, apply=True)
 
     assert result.aborted is False
     assert result.disabled_usernames == ("c",)
@@ -107,10 +91,10 @@ def test_no_action_when_all_accounts_confirmed() -> None:
     seed_active_account(
         directory, ou_dn=OU_SUBJECT, username="a", first="A", last="A", created_at=_OLD
     )
-    lms = FakeLmsApi(active_usernames=["a"])
-    reconciler = make_reconciler(directory, lms)
+    active = ["a"]
+    reconciler = make_reconciler(directory)
 
-    result = reconciler.run_once()
+    result = reconciler.run(active, apply=True)
 
     assert result.aborted is False
     assert result.disabled_usernames == ()
@@ -122,11 +106,11 @@ def test_empty_active_list_with_nonempty_zone_aborts(caplog: pytest.LogCaptureFi
     seed_active_account(
         directory, ou_dn=OU_SUBJECT, username="a", first="A", last="A", created_at=_OLD
     )
-    lms = FakeLmsApi(active_usernames=[])
-    reconciler = make_reconciler(directory, lms)
+    active = []
+    reconciler = make_reconciler(directory)
 
     with caplog.at_level(logging.ERROR, logger="adsync.reconcile"):
-        result = reconciler.run_once()
+        result = reconciler.run(active, apply=True)
 
     assert result.aborted is True
     assert result.disabled_usernames == ()
@@ -141,10 +125,10 @@ def test_max_disable_threshold_aborts() -> None:
             directory, ou_dn=OU_SUBJECT, username=name, first=name, last=name, created_at=_OLD
         )
     # непустой active-список из постороннего логина -> все три учётки зоны считаются "лишними"
-    lms = FakeLmsApi(active_usernames=["someone-else"])
-    reconciler = make_reconciler(directory, lms, max_disable=2, max_disable_pct=100)
+    active = ["someone-else"]
+    reconciler = make_reconciler(directory, max_disable=2, max_disable_pct=100)
 
-    result = reconciler.run_once()
+    result = reconciler.run(active, apply=True)
 
     assert result.aborted is True
     assert result.disabled_usernames == ()
@@ -158,10 +142,10 @@ def test_max_disable_pct_threshold_aborts() -> None:
             directory, ou_dn=OU_SUBJECT, username=name, first=name, last=name, created_at=_OLD
         )
     # 2 из 4 лишних = 50% > порога 20%, но меньше max_disable по количеству
-    lms = FakeLmsApi(active_usernames=["a", "b"])
-    reconciler = make_reconciler(directory, lms, max_disable=10, max_disable_pct=20)
+    active = ["a", "b"]
+    reconciler = make_reconciler(directory, max_disable=10, max_disable_pct=20)
 
-    result = reconciler.run_once()
+    result = reconciler.run(active, apply=True)
 
     assert result.aborted is True
     assert result.disabled_usernames == ()
@@ -180,10 +164,10 @@ def test_grace_period_excludes_recent_account_from_stale_count() -> None:
     seed_active_account(
         directory, ou_dn=OU_SUBJECT, username="confirmed", first="C", last="C", created_at=_OLD
     )
-    lms = FakeLmsApi(active_usernames=["confirmed"])
-    reconciler = make_reconciler(directory, lms, grace_minutes=15)
+    active = ["confirmed"]
+    reconciler = make_reconciler(directory, grace_minutes=15)
 
-    result = reconciler.run_once()
+    result = reconciler.run(active, apply=True)
 
     assert result.aborted is False
     assert result.disabled_usernames == ("old",)
@@ -191,53 +175,62 @@ def test_grace_period_excludes_recent_account_from_stale_count() -> None:
     assert directory.users_by_username["confirmed"].enabled is True
 
 
-def test_get_active_usernames_failure_aborts(caplog: pytest.LogCaptureFixture) -> None:
-    directory = make_directory()
-    seed_active_account(
-        directory, ou_dn=OU_SUBJECT, username="a", first="A", last="A", created_at=_OLD
-    )
-    lms = FailingLmsApi()
-    reconciler = make_reconciler(directory, lms)
-
-    with caplog.at_level(logging.ERROR, logger="adsync.reconcile"):
-        result = reconciler.run_once()
-
-    assert result.aborted is True
-    assert directory.users_by_username["a"].enabled is True
-    assert "не удалось получить список активных логинов" in caplog.text
-
-
-def test_disabled_module_skips_reconcile_without_error_level(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Модуль выключен на сайте — сверять не с чем: пропуск WARNING'ом, без ложной тревоги ERROR."""
-    directory = make_directory()
-    seed_active_account(
-        directory, ou_dn=OU_SUBJECT, username="a", first="A", last="A", created_at=_OLD
-    )
-    lms = ModuleDisabledLmsApi()
-    reconciler = make_reconciler(directory, lms)
-
-    with caplog.at_level(logging.WARNING, logger="adsync.reconcile"):
-        result = reconciler.run_once()
-
-    assert result.aborted is True
-    assert result.disabled_usernames == ()
-    assert directory.users_by_username["a"].enabled is True
-    assert [record.levelno for record in caplog.records] == [logging.WARNING]
-    assert getattr(caplog.records[0], "event", None) == "lms_module_unavailable"
-    assert caplog.records[0].exc_info is None
-
-
 def test_reconcile_is_one_directional_never_enables_or_creates() -> None:
     directory = make_directory()
     seed_active_account(
         directory, ou_dn=OU_SUBJECT, username="a", first="A", last="A", created_at=_OLD
     )
-    lms = FakeLmsApi(active_usernames=[])
-    reconciler = make_reconciler(directory, lms)
+    active = []
+    reconciler = make_reconciler(directory)
 
-    reconciler.run_once()
+    reconciler.run(active, apply=True)
 
     assert set(directory.users_by_username) == {"a"}
     assert directory.group_members == {}
+
+
+def test_dry_run_reports_but_touches_nothing(caplog: pytest.LogCaptureFixture) -> None:
+    """Режим «только журнал» (первая неделя): кого отключила бы — в ответ и в лог, AD не тронут."""
+    directory = make_directory()
+    seed_active_account(
+        directory, ou_dn=OU_SUBJECT, username="a", first="A", last="A", created_at=_OLD
+    )
+    seed_active_account(
+        directory, ou_dn=OU_SUBJECT, username="b", first="B", last="B", created_at=_OLD
+    )
+    reconciler = make_reconciler(directory)
+
+    with caplog.at_level(logging.INFO, logger="adsync.reconcile"):
+        result = reconciler.run(["a"], apply=False)
+
+    assert result.aborted is False
+    assert result.applied is False
+    assert result.disabled_usernames == ("b",)
+    assert directory.users_by_username["b"].enabled is True
+    assert not directory.users_by_username["b"].dn.endswith(OU_DISABLED)
+    assert getattr(caplog.records[-1], "event", None) == "reconcile_dry_run"
+
+
+def test_dry_run_still_respects_guards() -> None:
+    """Предохранитель срабатывает и в режиме «только журнал» — админ увидит abort до включения."""
+    directory = make_directory()
+    for name in ("a", "b", "c"):
+        seed_active_account(
+            directory, ou_dn=OU_SUBJECT, username=name, first=name, last=name, created_at=_OLD
+        )
+    reconciler = make_reconciler(directory, max_disable=1)
+
+    result = reconciler.run(["someone-else"], apply=False)
+
+    assert result.aborted is True
+    assert result.disabled_usernames == ()
+
+
+def test_unavailable_directory_propagates() -> None:
+    """DC недоступен — не abort сверки, а исключение: API ответит сайту 503."""
+    directory = make_directory()
+    directory.unavailable = True
+    reconciler = make_reconciler(directory)
+
+    with pytest.raises(DirectoryUnavailableError):
+        reconciler.run(["a"], apply=True)

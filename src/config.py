@@ -60,13 +60,14 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
-    lms_base_url: str
-    fs_lms_ad_hmac_secret: str
+    fs_lms_ad_hmac_secret: str = Field(min_length=1)
+    hmac_max_skew_seconds: int = Field(default=300, ge=1)
 
-    jobs_poll_seconds: int = 3
-    jobs_limit: int = Field(default=50, ge=1, le=200)
+    # Публичный API для сайта: HTTPS с самоподписанным сертификатом (IP офиса в SAN).
+    public_port: int = 8443
+    tls_cert_file: Path = Path("/app/config/tls/server.crt")
+    tls_key_file: Path = Path("/app/config/tls/server.key")
 
-    reconcile_interval_hours: int = 6
     reconcile_grace_minutes: int = 15
     reconcile_max_disable: int = 10
     reconcile_max_disable_pct: int = Field(default=20, ge=0, le=100)

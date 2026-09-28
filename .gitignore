@@ -8,3 +8,7 @@ __pycache__/
 .ruff_cache/
 dist/
 *.egg-info/
+
+# TLS публичного API: закрытый ключ никогда не коммитится
+/config/tls/
+*.key

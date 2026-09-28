@@ -1,15 +1,18 @@
-"""Тесты DTO-моделей контракта LMS (`models.py`)."""
+"""Тесты DTO-моделей контракта с сайтом (`models.py`)."""
 
 import pytest
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from models import (
-    AckRequest,
-    ActiveUsernamesResponse,
     DeprovisionJob,
-    JobsResponse,
+    Job,
+    JobResultResponse,
+    PasswordJob,
     ProvisionJob,
+    ReconcileRequest,
 )
+
+_JOB = TypeAdapter(Job)
 
 
 def test_provision_job_parses_from_raw_payload() -> None:
@@ -41,38 +44,30 @@ def test_deprovision_job_parses_from_raw_payload() -> None:
     assert job.username == "a.sidorov"
 
 
-def test_jobs_response_resolves_mixed_list_by_discriminator() -> None:
-    response = JobsResponse.model_validate(
+def test_job_adapter_resolves_event_by_discriminator() -> None:
+    provision = _JOB.validate_python(
         {
-            "jobs": [
-                {
-                    "id": 7,
-                    "event": "provision",
-                    "idempotency_key": "app:5",
-                    "username": "i.petrov",
-                    "password": "СекретУченика",
-                    "first": "Иван",
-                    "last": "Петров",
-                    "subject_key": "inf",
-                },
-                {
-                    "id": 8,
-                    "event": "deprovision",
-                    "idempotency_key": "deprovision:app:9",
-                    "username": "a.sidorov",
-                },
-            ]
+            "id": 7,
+            "event": "provision",
+            "idempotency_key": "app:5",
+            "username": "i.petrov",
+            "password": "СекретУченика",
+            "first": "Иван",
+            "last": "Петров",
+            "subject_key": "inf",
         }
     )
-    assert isinstance(response.jobs[0], ProvisionJob)
-    assert isinstance(response.jobs[1], DeprovisionJob)
+    deprovision = _JOB.validate_json(
+        '{"id": 8, "event": "deprovision", "idempotency_key": "deprovision:app:9", '
+        '"username": "a.sidorov"}'
+    )
+    assert isinstance(provision, ProvisionJob)
+    assert isinstance(deprovision, DeprovisionJob)
 
 
 def test_unknown_event_raises_validation_error() -> None:
     with pytest.raises(ValidationError):
-        JobsResponse.model_validate(
-            {"jobs": [{"id": 1, "event": "unknown", "idempotency_key": "x", "username": "u"}]}
-        )
+        _JOB.validate_python({"id": 1, "event": "unknown", "idempotency_key": "x", "username": "u"})
 
 
 def test_provision_job_missing_password_raises_validation_error() -> None:
@@ -90,23 +85,29 @@ def test_provision_job_missing_password_raises_validation_error() -> None:
         )
 
 
-def test_ack_request_accepts_done_without_error() -> None:
-    ack = AckRequest.model_validate({"id": 7, "status": "done"})
-    assert ack.error is None
+def test_job_result_serializes_without_error_when_done() -> None:
+    assert JobResultResponse(status="done").model_dump(exclude_none=True) == {"status": "done"}
 
 
-def test_ack_request_accepts_failed_with_error() -> None:
-    ack = AckRequest.model_validate({"id": 7, "status": "failed", "error": "ldap timeout"})
-    assert ack.error == "ldap timeout"
-
-
-def test_ack_request_rejects_invalid_status() -> None:
+def test_job_result_rejects_invalid_status() -> None:
     with pytest.raises(ValidationError):
-        AckRequest.model_validate({"id": 7, "status": "ok"})
+        JobResultResponse.model_validate({"status": "ok"})
 
 
-def test_active_usernames_response_parses() -> None:
-    response = ActiveUsernamesResponse.model_validate(
-        {"usernames": ["i.petrov", "a.sidorov", "p.orlov"]}
+def test_reconcile_request_defaults_to_dry_run() -> None:
+    request = ReconcileRequest.model_validate_json('{"usernames": ["i.petrov", "a.sidorov"]}')
+    assert request.usernames == ["i.petrov", "a.sidorov"]
+    assert request.apply is False
+
+
+def test_password_job_resolved_by_discriminator() -> None:
+    job = _JOB.validate_python(
+        {
+            "id": 9,
+            "event": "password",
+            "idempotency_key": "password:person:42:1",
+            "username": "i.petrov",
+            "password": "Новый123",
+        }
     )
-    assert response.usernames == ["i.petrov", "a.sidorov", "p.orlov"]
+    assert isinstance(job, PasswordJob)

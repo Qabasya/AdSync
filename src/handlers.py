@@ -1,8 +1,9 @@
 """Обработчики заданий: бизнес-ветвление поверх примитивов `DirectoryGateway`.
 
 Реализует таблицу «События → действия в AD» и «Правила поверх таблицы» из `.docs/CLAUDE.md`.
-Про HTTP/ack/журнал не знает — это `poller.py`, который также ловит любые исключения из
-`handle()` (LDAP-ошибки и т.п.) и превращает их в `ack(failed)`.
+Про HTTP/журнал не знает — это `jobs.py`, который также ловит любые исключения из
+`handle()` (LDAP-ошибки и т.п.) и превращает их в `failed` (кроме недоступности DC — она
+уходит сайту кодом `503`).
 """
 
 import logging
@@ -11,7 +12,7 @@ from typing import Literal, Protocol
 
 from ad import DirectoryGateway
 from config import SubjectConfig
-from models import DeprovisionJob, Job, ProvisionJob
+from models import DeprovisionJob, Job, PasswordJob, ProvisionJob
 
 logger = logging.getLogger("adsync.handlers")
 
@@ -28,7 +29,7 @@ class JobHandler(Protocol):
     """Контракт обработчика одного типа задания."""
 
     def handle(self, job: Job) -> HandlerResult:
-        """Обрабатывает задание и возвращает итог (без ack и без записи в журнал)."""
+        """Обрабатывает задание и возвращает итог (без ответа сайту и без записи в журнал)."""
         ...
 
 
@@ -159,5 +160,43 @@ class DeprovisionHandler:
             job.username,
             self._ou_disabled,
             extra={"event": "account_deprovisioned"},
+        )
+        return HandlerResult("done")
+
+
+class PasswordHandler:
+    """Обработчик `password`: тот же пароль, что администратор задал на сайте.
+
+    Только пароль — учётку не включает и не переносит: отключённая остаётся отключённой
+    (включает её `provision` при повторном зачислении). Нет учётки — `failed`: цель не
+    достигнута, и после 6 попыток администратор увидит задание «мёртвым».
+    """
+
+    def __init__(self, directory: DirectoryGateway) -> None:
+        self._directory = directory
+
+    def handle(self, job: Job) -> HandlerResult:
+        assert isinstance(job, PasswordJob)
+
+        user = self._directory.find_user(job.username)
+        if user is None:
+            logger.error(
+                "смена пароля %s: учётки нет в домене",
+                job.username,
+                extra={"event": "password_account_missing"},
+            )
+            return HandlerResult("failed", error="учётки нет в домене")
+
+        if not self._directory.is_in_managed_zone(user.dn):
+            logger.error(
+                "смена пароля %s: учётная запись вне управляемой зоны, объект не тронут",
+                job.username,
+                extra={"event": "zone_violation"},
+            )
+            return HandlerResult("failed", error="учётная запись вне управляемой зоны")
+
+        self._directory.ensure_password(user.dn, job.password)
+        logger.info(
+            "смена пароля %s: пароль обновлён", job.username, extra={"event": "password_changed"}
         )
         return HandlerResult("done")

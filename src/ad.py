@@ -16,9 +16,11 @@ from typing import Protocol, TypeVar
 
 from ldap3 import BASE, MODIFY_ADD, MODIFY_REPLACE, SUBTREE, Connection, Server, Tls
 from ldap3.core.exceptions import (
+    LDAPBindError,
     LDAPCommunicationError,
     LDAPEntryAlreadyExistsResult,
     LDAPNoSuchObjectResult,
+    LDAPStartTLSError,
 )
 from ldap3.utils.conv import escape_filter_chars
 from ldap3.utils.dn import escape_rdn, parse_dn
@@ -93,6 +95,14 @@ class ManagedZoneConfigError(Exception):
 
 class CnAllocationError(Exception):
     """В целевой OU не удалось подобрать свободный CN — объект не создан и не перенесён."""
+
+
+class DirectoryUnavailableError(Exception):
+    """Контроллер домена недоступен и после переподключения — временная проблема сервиса.
+
+    Не ошибка задания: API отвечает сайту `503`, сайт ставит доставку на паузу и попытку
+    задания не тратит (см. `.docs/AdSyncPythonService.md` §4.1).
+    """
 
 
 def _dn_components(dn: str) -> list[tuple[str, str]]:
@@ -176,6 +186,10 @@ class DirectoryGateway(Protocol):
         """Стартовая проверка: все DN конфигурации существуют в AD, иначе понятная ошибка."""
         ...
 
+    def ping(self) -> None:
+        """Лёгкая проверка связи с DC; недоступен — `DirectoryUnavailableError`."""
+        ...
+
     def list_zone_accounts(self) -> list[ZoneAccount]:
         """Перечисляет учётки во всех OU направлений + `AD_OU_FALLBACK` (без «Отчисленных»)."""
         ...
@@ -233,8 +247,17 @@ class AdGateway:
                 exc,
                 extra={"event": "ad_reconnect"},
             )
+        # Одна попытка переподключения: не вышло — DC недоступен, это не ошибка задания.
+        try:
             self._connection = self._reconnect()
             return operation()
+        except (LDAPCommunicationError, LDAPBindError, LDAPStartTLSError, OSError) as exc:
+            logger.error(
+                "Контроллер домена недоступен: %s",
+                exc,
+                extra={"event": "ad_unavailable"},
+            )
+            raise DirectoryUnavailableError(str(exc)) from exc
 
     def is_in_managed_zone(self, dn: str) -> bool:
         return any(_is_within_ou(dn, zone_dn) for zone_dn in self._zone_dns)
@@ -441,6 +464,16 @@ class AdGateway:
             raise ManagedZoneConfigError(
                 "в AD не найдены DN из конфигурации: " + ", ".join(missing)
             )
+
+    def ping(self) -> None:
+        def op() -> bool:
+            return bool(
+                self._connection.search(
+                    self._domain_root_dn, "(objectClass=*)", BASE, attributes=["objectClass"]
+                )
+            )
+
+        self._run(op)
 
     def list_zone_accounts(self) -> list[ZoneAccount]:
         accounts: dict[str, ZoneAccount] = {}
