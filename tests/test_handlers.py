@@ -7,8 +7,14 @@ from fakes import FakeDirectoryGateway
 
 from ad import DirectoryUser
 from config import SubjectConfig
-from handlers import DeprovisionHandler, PasswordHandler, ProvisionHandler
-from models import DeprovisionJob, PasswordJob, ProvisionJob
+from handlers import (
+    DeleteHandler,
+    DeprovisionHandler,
+    PasswordHandler,
+    ProvisionHandler,
+    RenameHandler,
+)
+from models import DeleteJob, DeprovisionJob, PasswordJob, ProvisionJob, RenameJob
 
 OU_SUBJECT = "OU=KEGE,OU=Ученики,DC=fs,DC=loc"
 GROUP_SUBJECT = "CN=KEGE,OU=Группы,DC=fs,DC=loc"
@@ -23,6 +29,41 @@ def make_directory() -> FakeDirectoryGateway:
     return FakeDirectoryGateway(
         zone_ou_dns={OU_SUBJECT}, ou_disabled=OU_DISABLED, ou_fallback=OU_FALLBACK
     )
+
+
+def test_rename_updates_name_without_changing_login_or_ou() -> None:
+    directory = make_directory()
+    dn = directory.create_user(ou_dn=OU_SUBJECT, username="ivanov", first="Иван", last="Иванов")
+    directory.ensure_enabled(dn)
+    job = RenameJob(
+        id=10,
+        event="rename",
+        idempotency_key="name-10",
+        username="ivanov",
+        first="Пётр",
+        last="Петров",
+        middle="Андреевич",
+    )
+
+    result = RenameHandler(directory).handle(job)
+
+    assert result.outcome == "renamed"
+    assert directory.names["ivanov"] == ("Пётр", "Петров", "Андреевич")
+    assert directory.users_by_username["ivanov"].dn.endswith(OU_SUBJECT)
+    assert directory.users_by_username["ivanov"].enabled
+
+
+def test_delete_is_idempotent_and_does_not_touch_foreign_accounts() -> None:
+    directory = make_directory()
+    directory.create_user(ou_dn=OU_SUBJECT, username="ivanov", first="Иван", last="Иванов")
+    job = DeleteJob(id=11, event="delete", idempotency_key="delete-11", username="ivanov")
+    handler = DeleteHandler(directory)
+
+    assert handler.handle(job).outcome == "deleted"
+    assert handler.handle(job).outcome == "delete_absent"
+    directory.create_user(ou_dn=OU_OUTSIDE, username="ivanov", first="Иван", last="Иванов")
+    assert handler.handle(job).status == "failed"
+    assert "ivanov" in directory.users_by_username
 
 
 def provision_job(**overrides: object) -> ProvisionJob:

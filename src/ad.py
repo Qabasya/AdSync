@@ -192,6 +192,14 @@ class DirectoryGateway(Protocol):
         """Путь к профилю и «пароль без срока» по конфигурации. Включённость не меняет."""
         ...
 
+    def rename_user(self, dn: str, username: str, first: str, last: str, middle: str) -> str:
+        """Обновляет атрибуты имени и CN, сохраняя логин и OU."""
+        ...
+
+    def delete_user(self, dn: str) -> None:
+        """Физически удаляет объект в управляемой зоне."""
+        ...
+
     def ping(self) -> None:
         """Лёгкая проверка связи с DC; недоступен — `DirectoryUnavailableError`."""
         ...
@@ -509,6 +517,45 @@ class AdGateway:
 
     def _move(self, dn: str, new_rdn: str, target_ou_dn: str) -> bool:
         return bool(self._connection.modify_dn(dn, new_rdn, new_superior=target_ou_dn))
+
+    def rename_user(self, dn: str, username: str, first: str, last: str, middle: str) -> str:
+        if not self.is_in_managed_zone(dn):
+            raise OutsideManagedZoneError(dn)
+        display_name = " ".join(part for part in (last, first, middle) if part)
+        changes = {
+            "givenName": [(MODIFY_REPLACE, [first])],
+            "sn": [(MODIFY_REPLACE, [last])],
+            "displayName": [(MODIFY_REPLACE, [display_name])],
+            "middleName": [(MODIFY_REPLACE, [middle] if middle else [])],
+        }
+        self._run(lambda: bool(self._connection.modify(dn, changes)))
+        self._log_result("ФИО обновлено", dn)
+        parent = _parent_ou(dn)
+        for candidate in _cn_candidates(display_name, username):
+            new_rdn = f"CN={escape_rdn(candidate)}"
+            new_dn = f"{new_rdn},{parent}"
+            if _dn_equals(dn, new_dn):
+                return dn
+            try:
+
+                def op(rdn: str = new_rdn) -> bool:
+                    return bool(self._connection.modify_dn(dn, rdn))
+
+                self._run(op)
+            except LDAPEntryAlreadyExistsResult:
+                continue
+            self._log_result("CN обновлён", new_dn)
+            return new_dn
+        raise CnAllocationError(f"не удалось подобрать CN для {username}")
+
+    def delete_user(self, dn: str) -> None:
+        if not self.is_in_managed_zone(dn):
+            raise OutsideManagedZoneError(dn)
+        try:
+            self._run(lambda: bool(self._connection.delete(dn)))
+        except LDAPNoSuchObjectResult:
+            return
+        self._log_result("учётная запись удалена", dn)
 
     def verify_zone_exists(self) -> None:
         missing = [dn for dn in self._config_dns if not self._dn_exists(dn)]

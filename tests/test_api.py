@@ -120,6 +120,28 @@ def test_job_done_is_returned_synchronously() -> None:
     assert isinstance(api.jobs[0], ProvisionJob)
 
 
+def test_excluded_login_cleanup_is_accepted_without_credentials_or_source() -> None:
+    """LMS exclusions send delete with a saved target, without student/password fields."""
+    api = PublicApi()
+    api.job_result = HandlerResult("done", outcome="delete_absent")
+
+    code, body = api.post(
+        "/v1/jobs",
+        {
+            "id": 18,
+            "event": "delete",
+            "idempotency_key": "exclude:9f86d081:20261016",
+            "username": "test",
+        },
+    )
+
+    assert code == 200
+    assert body == {"status": "done", "error": None, "outcome": "delete_absent"}
+    assert len(api.jobs) == 1
+    assert api.jobs[0].event == "delete"
+    assert api.jobs[0].username == "test"
+
+
 def test_job_failed_carries_error() -> None:
     api = PublicApi()
     api.job_result = HandlerResult("failed", error="учётная запись вне управляемой зоны")

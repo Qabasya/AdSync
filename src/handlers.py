@@ -12,7 +12,7 @@ from typing import Literal, Protocol
 
 from ad import DirectoryGateway
 from config import SubjectConfig
-from models import DeprovisionJob, Job, Outcome, PasswordJob, ProvisionJob
+from models import DeleteJob, DeprovisionJob, Job, Outcome, PasswordJob, ProvisionJob, RenameJob
 
 logger = logging.getLogger("adsync.handlers")
 
@@ -204,3 +204,39 @@ class PasswordHandler:
             "смена пароля %s: пароль обновлён", job.username, extra={"event": "password_changed"}
         )
         return HandlerResult("done", outcome="password_changed")
+
+
+class RenameHandler:
+    """Обновляет ФИО только у управляемой учётки."""
+
+    def __init__(self, directory: DirectoryGateway) -> None:
+        self._directory = directory
+
+    def handle(self, job: Job) -> HandlerResult:
+        assert isinstance(job, RenameJob)
+        user = self._directory.find_user(job.username)
+        if user is None:
+            return HandlerResult("failed", error="учётки нет в домене")
+        if not self._directory.is_in_managed_zone(user.dn):
+            return HandlerResult("failed", error="учётная запись вне управляемой зоны")
+        self._directory.rename_user(user.dn, job.username, job.first, job.last, job.middle)
+        logger.info("ФИО учётки %s обновлено", job.username, extra={"event": "account_renamed"})
+        return HandlerResult("done", outcome="renamed")
+
+
+class DeleteHandler:
+    """Окончательно удаляет только учётку в управляемой зоне."""
+
+    def __init__(self, directory: DirectoryGateway) -> None:
+        self._directory = directory
+
+    def handle(self, job: Job) -> HandlerResult:
+        assert isinstance(job, DeleteJob)
+        user = self._directory.find_user(job.username)
+        if user is None:
+            return HandlerResult("done", outcome="delete_absent")
+        if not self._directory.is_in_managed_zone(user.dn):
+            return HandlerResult("failed", error="учётная запись вне управляемой зоны")
+        self._directory.delete_user(user.dn)
+        logger.info("учётка %s удалена", job.username, extra={"event": "account_deleted"})
+        return HandlerResult("done", outcome="deleted")

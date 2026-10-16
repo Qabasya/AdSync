@@ -41,13 +41,45 @@ class PasswordJob(BaseModel):
     password: str
 
 
+class RenameJob(BaseModel):
+    """Обновление ФИО уже созданной учётки."""
+
+    id: int
+    event: Literal["rename"]
+    idempotency_key: str
+    username: str
+    first: str
+    last: str
+    middle: str = ""
+
+
+class DeleteJob(BaseModel):
+    """Окончательное удаление учётки после очистки корзины заявок."""
+
+    id: int
+    event: Literal["delete"]
+    idempotency_key: str
+    username: str
+
+
 # Что сделано с учёткой — сайт пишет это в журнал «Зачисления».
 # `absent` — deprovision, а учётки в домене нет (цель и так достигнута).
 Outcome = Literal[
-    "created", "reactivated", "updated", "deprovisioned", "absent", "password_changed"
+    "created",
+    "reactivated",
+    "updated",
+    "deprovisioned",
+    "absent",
+    "password_changed",
+    "renamed",
+    "deleted",
+    "delete_absent",
 ]
 
-Job = Annotated[ProvisionJob | DeprovisionJob | PasswordJob, Field(discriminator="event")]
+Job = Annotated[
+    ProvisionJob | DeprovisionJob | PasswordJob | RenameJob | DeleteJob,
+    Field(discriminator="event"),
+]
 
 
 class JobResultResponse(BaseModel):

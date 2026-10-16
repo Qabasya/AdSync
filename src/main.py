@@ -23,11 +23,13 @@ from api import AppState, create_local_api, create_public_api
 from auth import SignatureVerifier
 from config import Settings, SubjectConfig, load_subjects
 from handlers import (
+    DeleteHandler,
     DeprovisionHandler,
     HandlerResult,
     JobHandler,
     PasswordHandler,
     ProvisionHandler,
+    RenameHandler,
 )
 from jobs import JobProcessor
 from logging_setup import configure_logging
@@ -156,6 +158,8 @@ def main() -> None:
         ),
         "deprovision": DeprovisionHandler(jobs_directory, ou_disabled=settings.ad_ou_disabled),
         "password": PasswordHandler(jobs_directory),
+        "rename": RenameHandler(jobs_directory),
+        "delete": DeleteHandler(jobs_directory),
     }
 
     processor = JobProcessor(handlers=handlers, repository=repository, now=_now)
