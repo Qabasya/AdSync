@@ -26,6 +26,9 @@ class FakeDirectoryGateway:
         self.created_at: dict[str, datetime] = {}
         # True — имитация недоступного DC: чтение из AD поднимает DirectoryUnavailableError.
         self.unavailable = False
+        # DN → логин, для которого приводились профиль и срок пароля (ensure_account_settings).
+        self.account_settings: dict[str, str] = {}
+        self.names: dict[str, tuple[str, str, str]] = {}
 
     def _check_available(self) -> None:
         if self.unavailable:
@@ -64,6 +67,30 @@ class FakeDirectoryGateway:
         if not self.is_in_managed_zone(dn):
             raise OutsideManagedZoneError(dn)
         self.passwords[dn] = password
+
+    def ensure_account_settings(self, dn: str, username: str) -> None:
+        if not self.is_in_managed_zone(dn):
+            raise OutsideManagedZoneError(dn)
+        self.account_settings[dn] = username
+
+    def rename_user(self, dn: str, username: str, first: str, last: str, middle: str) -> str:
+        if not self.is_in_managed_zone(dn):
+            raise OutsideManagedZoneError(dn)
+        user = self.users_by_username[username]
+        parent = dn.split(",", 1)[1]
+        display_name = " ".join(part for part in (last, first, middle) if part)
+        new_dn = f"CN={display_name},{parent}"
+        self.users_by_username[username] = DirectoryUser(dn=new_dn, enabled=user.enabled)
+        self.names[username] = (first, last, middle)
+        return new_dn
+
+    def delete_user(self, dn: str) -> None:
+        if not self.is_in_managed_zone(dn):
+            raise OutsideManagedZoneError(dn)
+        for username, user in list(self.users_by_username.items()):
+            if user.dn == dn:
+                del self.users_by_username[username]
+                return
 
     def ensure_enabled(self, dn: str) -> None:
         self._set_enabled(dn, enabled=True)

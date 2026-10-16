@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -79,6 +79,10 @@ class Settings(BaseSettings):
     ldap_bind_password: str
 
     ad_upn_suffix: str = "fs.loc"
+    # Галка «Срок действия пароля не ограничен» у учёток учеников.
+    ad_password_never_expires: bool = True
+    # Путь к перемещаемому профилю; `{username}` — логин. Пусто — атрибут не трогается.
+    ad_profile_path_template: str | None = None
     ad_ou_disabled: str
     ad_ou_fallback: str
 
@@ -92,3 +96,13 @@ class Settings(BaseSettings):
     heartbeat_interval_seconds: int = Field(default=3600, ge=1)
 
     api_port: int = 8091
+
+    @field_validator("ad_profile_path_template")
+    @classmethod
+    def _profile_template_has_username(cls, value: str | None) -> str | None:
+        """Без `{username}` все ученики получили бы один профиль — лучше упасть на старте."""
+        if value is not None and value.strip() == "":
+            return None
+        if value is not None and "{username}" not in value:
+            raise ValueError("AD_PROFILE_PATH_TEMPLATE должен содержать {username}")
+        return value

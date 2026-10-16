@@ -59,7 +59,7 @@ class PublicApi:
 
     def __init__(self) -> None:
         self.jobs: list[Job] = []
-        self.job_result = HandlerResult("done")
+        self.job_result = HandlerResult("done", outcome="created")
         self.reconcile_calls: list[tuple[list[str], bool]] = []
         self.reconcile_result = ReconcileResult(("x.stale",), aborted=False, applied=False)
         self.dc_down = False
@@ -116,8 +116,30 @@ def test_job_done_is_returned_synchronously() -> None:
     code, body = api.post("/v1/jobs", _PROVISION)
 
     assert code == 200
-    assert body == {"status": "done", "error": None}
+    assert body == {"status": "done", "error": None, "outcome": "created"}
     assert isinstance(api.jobs[0], ProvisionJob)
+
+
+def test_excluded_login_cleanup_is_accepted_without_credentials_or_source() -> None:
+    """LMS exclusions send delete with a saved target, without student/password fields."""
+    api = PublicApi()
+    api.job_result = HandlerResult("done", outcome="delete_absent")
+
+    code, body = api.post(
+        "/v1/jobs",
+        {
+            "id": 18,
+            "event": "delete",
+            "idempotency_key": "exclude:9f86d081:20261016",
+            "username": "test",
+        },
+    )
+
+    assert code == 200
+    assert body == {"status": "done", "error": None, "outcome": "delete_absent"}
+    assert len(api.jobs) == 1
+    assert api.jobs[0].event == "delete"
+    assert api.jobs[0].username == "test"
 
 
 def test_job_failed_carries_error() -> None:

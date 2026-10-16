@@ -12,7 +12,7 @@ from typing import Literal, Protocol
 
 from ad import DirectoryGateway
 from config import SubjectConfig
-from models import DeprovisionJob, Job, PasswordJob, ProvisionJob
+from models import DeleteJob, DeprovisionJob, Job, Outcome, PasswordJob, ProvisionJob, RenameJob
 
 logger = logging.getLogger("adsync.handlers")
 
@@ -23,6 +23,8 @@ class HandlerResult:
 
     status: Literal["done", "failed"]
     error: str | None = None
+    # Что именно сделано с учёткой (для журнала сайта); у `failed` — None.
+    outcome: Outcome | None = None
 
 
 class JobHandler(Protocol):
@@ -74,13 +76,14 @@ class ProvisionHandler:
             self._directory.ensure_enabled(dn)
             if target_group is not None:
                 self._directory.ensure_group_membership(dn, target_group)
+            self._directory.ensure_account_settings(dn, job.username)
             logger.info(
                 "создана учётка %s в %s",
                 job.username,
                 target_ou,
                 extra={"event": "account_created"},
             )
-            return HandlerResult("done")
+            return HandlerResult("done", outcome="created")
 
         if self._directory.is_in_disabled_ou(existing.dn):
             self._directory.ensure_enabled(existing.dn)
@@ -88,6 +91,7 @@ class ProvisionHandler:
             self._directory.ensure_password(new_dn, job.password)
             if target_group is not None:
                 self._directory.ensure_group_membership(new_dn, target_group)
+            self._directory.ensure_account_settings(new_dn, job.username)
             logger.info(
                 "реактивирована учётка %s: %s → %s",
                 job.username,
@@ -95,7 +99,7 @@ class ProvisionHandler:
                 target_ou,
                 extra={"event": "account_reactivated"},
             )
-            return HandlerResult("done")
+            return HandlerResult("done", outcome="reactivated")
 
         if self._directory.is_in_managed_zone(existing.dn):
             self._directory.ensure_password(existing.dn, job.password)
@@ -105,10 +109,11 @@ class ProvisionHandler:
             self._directory.ensure_enabled(existing.dn)
             if target_group is not None:
                 self._directory.ensure_group_membership(existing.dn, target_group)
+            self._directory.ensure_account_settings(existing.dn, job.username)
             logger.info(
                 "обновлена учётка %s в зоне", job.username, extra={"event": "account_updated"}
             )
-            return HandlerResult("done")
+            return HandlerResult("done", outcome="updated")
 
         logger.error(
             "provision %s: учётная запись вне управляемой зоны, объект не тронут",
@@ -135,7 +140,7 @@ class DeprovisionHandler:
                 job.username,
                 extra={"event": "account_deprovisioned"},
             )
-            return HandlerResult("done")
+            return HandlerResult("done", outcome="absent")
 
         if not self._directory.is_in_managed_zone(user.dn):
             logger.error(
@@ -145,23 +150,19 @@ class DeprovisionHandler:
             )
             return HandlerResult("failed", error="учётная запись вне управляемой зоны")
 
-        if not user.enabled:
-            logger.info(
-                "deprovision %s: уже отключена",
-                job.username,
-                extra={"event": "account_deprovisioned"},
-            )
-            return HandlerResult("done")
-
-        self._directory.ensure_disabled(user.dn)
-        self._directory.move_to_ou(user.dn, self._ou_disabled)
+        # Цель — оба условия сразу: отключена И лежит в «Отчисленных». Приводим каждое
+        # отдельно — учётку могли вручную включить обратно или перенести, не отключив.
+        if user.enabled:
+            self._directory.ensure_disabled(user.dn)
+        if not self._directory.is_in_disabled_ou(user.dn):
+            self._directory.move_to_ou(user.dn, self._ou_disabled)
         logger.info(
-            "deprovision %s: отключена и перенесена в %s",
+            "deprovision %s: отключена, в %s",
             job.username,
             self._ou_disabled,
             extra={"event": "account_deprovisioned"},
         )
-        return HandlerResult("done")
+        return HandlerResult("done", outcome="deprovisioned")
 
 
 class PasswordHandler:
@@ -196,7 +197,46 @@ class PasswordHandler:
             return HandlerResult("failed", error="учётная запись вне управляемой зоны")
 
         self._directory.ensure_password(user.dn, job.password)
+        # Заодно — путь к профилю и «пароль без срока»: так приводятся учётки, созданные
+        # до появления этих настроек (достаточно сменить пароль на сайте).
+        self._directory.ensure_account_settings(user.dn, job.username)
         logger.info(
             "смена пароля %s: пароль обновлён", job.username, extra={"event": "password_changed"}
         )
-        return HandlerResult("done")
+        return HandlerResult("done", outcome="password_changed")
+
+
+class RenameHandler:
+    """Обновляет ФИО только у управляемой учётки."""
+
+    def __init__(self, directory: DirectoryGateway) -> None:
+        self._directory = directory
+
+    def handle(self, job: Job) -> HandlerResult:
+        assert isinstance(job, RenameJob)
+        user = self._directory.find_user(job.username)
+        if user is None:
+            return HandlerResult("failed", error="учётки нет в домене")
+        if not self._directory.is_in_managed_zone(user.dn):
+            return HandlerResult("failed", error="учётная запись вне управляемой зоны")
+        self._directory.rename_user(user.dn, job.username, job.first, job.last, job.middle)
+        logger.info("ФИО учётки %s обновлено", job.username, extra={"event": "account_renamed"})
+        return HandlerResult("done", outcome="renamed")
+
+
+class DeleteHandler:
+    """Окончательно удаляет только учётку в управляемой зоне."""
+
+    def __init__(self, directory: DirectoryGateway) -> None:
+        self._directory = directory
+
+    def handle(self, job: Job) -> HandlerResult:
+        assert isinstance(job, DeleteJob)
+        user = self._directory.find_user(job.username)
+        if user is None:
+            return HandlerResult("done", outcome="delete_absent")
+        if not self._directory.is_in_managed_zone(user.dn):
+            return HandlerResult("failed", error="учётная запись вне управляемой зоны")
+        self._directory.delete_user(user.dn)
+        logger.info("учётка %s удалена", job.username, extra={"event": "account_deleted"})
+        return HandlerResult("done", outcome="deleted")

@@ -7,8 +7,14 @@ from fakes import FakeDirectoryGateway
 
 from ad import DirectoryUser
 from config import SubjectConfig
-from handlers import DeprovisionHandler, PasswordHandler, ProvisionHandler
-from models import DeprovisionJob, PasswordJob, ProvisionJob
+from handlers import (
+    DeleteHandler,
+    DeprovisionHandler,
+    PasswordHandler,
+    ProvisionHandler,
+    RenameHandler,
+)
+from models import DeleteJob, DeprovisionJob, PasswordJob, ProvisionJob, RenameJob
 
 OU_SUBJECT = "OU=KEGE,OU=Ученики,DC=fs,DC=loc"
 GROUP_SUBJECT = "CN=KEGE,OU=Группы,DC=fs,DC=loc"
@@ -23,6 +29,41 @@ def make_directory() -> FakeDirectoryGateway:
     return FakeDirectoryGateway(
         zone_ou_dns={OU_SUBJECT}, ou_disabled=OU_DISABLED, ou_fallback=OU_FALLBACK
     )
+
+
+def test_rename_updates_name_without_changing_login_or_ou() -> None:
+    directory = make_directory()
+    dn = directory.create_user(ou_dn=OU_SUBJECT, username="ivanov", first="Иван", last="Иванов")
+    directory.ensure_enabled(dn)
+    job = RenameJob(
+        id=10,
+        event="rename",
+        idempotency_key="name-10",
+        username="ivanov",
+        first="Пётр",
+        last="Петров",
+        middle="Андреевич",
+    )
+
+    result = RenameHandler(directory).handle(job)
+
+    assert result.outcome == "renamed"
+    assert directory.names["ivanov"] == ("Пётр", "Петров", "Андреевич")
+    assert directory.users_by_username["ivanov"].dn.endswith(OU_SUBJECT)
+    assert directory.users_by_username["ivanov"].enabled
+
+
+def test_delete_is_idempotent_and_does_not_touch_foreign_accounts() -> None:
+    directory = make_directory()
+    directory.create_user(ou_dn=OU_SUBJECT, username="ivanov", first="Иван", last="Иванов")
+    job = DeleteJob(id=11, event="delete", idempotency_key="delete-11", username="ivanov")
+    handler = DeleteHandler(directory)
+
+    assert handler.handle(job).outcome == "deleted"
+    assert handler.handle(job).outcome == "delete_absent"
+    directory.create_user(ou_dn=OU_OUTSIDE, username="ivanov", first="Иван", last="Иванов")
+    assert handler.handle(job).status == "failed"
+    assert "ivanov" in directory.users_by_username
 
 
 def provision_job(**overrides: object) -> ProvisionJob:
@@ -187,10 +228,26 @@ class TestDeprovisionHandler:
         assert user.dn.endswith(OU_DISABLED)
         assert "ivanov" in caplog.text
 
-    def test_already_disabled_user_is_done_without_further_changes(self) -> None:
+    def test_disabled_user_outside_disabled_ou_is_moved(self) -> None:
+        """Отключённая, но не перенесённая учётка (ручная правка) доводится до «Отчисленных»."""
         directory = make_directory()
         dn = directory.create_user(ou_dn=OU_SUBJECT, username="ivanov", first="Иван", last="Иванов")
         directory.ensure_disabled(dn)
+        handler = DeprovisionHandler(directory, ou_disabled=OU_DISABLED)
+
+        result = handler.handle(deprovision_job())
+
+        assert result.status == "done"
+        user = directory.users_by_username["ivanov"]
+        assert user.dn.endswith(OU_DISABLED)
+        assert user.enabled is False
+
+    def test_enabled_user_in_disabled_ou_is_disabled(self) -> None:
+        """Учётку в «Отчисленных» включили вручную — повторное отчисление её отключает."""
+        directory = make_directory()
+        dn = directory.create_user(ou_dn=OU_SUBJECT, username="ivanov", first="Иван", last="Иванов")
+        dn = directory.move_to_ou(dn, OU_DISABLED)
+        directory.ensure_enabled(dn)
         handler = DeprovisionHandler(directory, ou_disabled=OU_DISABLED)
 
         result = handler.handle(deprovision_job())
@@ -271,3 +328,77 @@ class TestPasswordHandler:
 
         assert result.status == "failed"
         assert dn not in directory.passwords
+
+
+class TestAccountSettings:
+    """Профиль и «пароль без срока» приводятся во всех ветках, где учётка остаётся нашей."""
+
+    def test_new_user_gets_account_settings(self) -> None:
+        directory = make_directory()
+
+        ProvisionHandler(directory, subjects=SUBJECTS, ou_fallback=OU_FALLBACK).handle(
+            provision_job()
+        )
+
+        dn = directory.users_by_username["ivanov"].dn
+        assert directory.account_settings[dn] == "ivanov"
+
+    def test_reactivated_user_gets_account_settings(self) -> None:
+        directory = make_directory()
+        directory.create_user(ou_dn=OU_DISABLED, username="ivanov", first="Иван", last="Иванов")
+
+        ProvisionHandler(directory, subjects=SUBJECTS, ou_fallback=OU_FALLBACK).handle(
+            provision_job()
+        )
+
+        dn = directory.users_by_username["ivanov"].dn
+        assert dn.endswith(OU_SUBJECT)
+        assert directory.account_settings[dn] == "ivanov"
+
+    def test_password_change_fixes_older_account(self) -> None:
+        """Учётка, созданная до появления настроек, приводится обычной сменой пароля."""
+        directory = make_directory()
+        dn = directory.create_user(ou_dn=OU_SUBJECT, username="ivanov", first="Иван", last="Иванов")
+
+        PasswordHandler(directory).handle(password_job())
+
+        assert directory.account_settings[dn] == "ivanov"
+
+    def test_outside_zone_account_is_not_touched(self) -> None:
+        directory = make_directory()
+        dn = directory.create_user(ou_dn=OU_OUTSIDE, username="ivanov", first="Иван", last="Иванов")
+
+        ProvisionHandler(directory, subjects=SUBJECTS, ou_fallback=OU_FALLBACK).handle(
+            provision_job()
+        )
+
+        assert dn not in directory.account_settings
+
+
+class TestOutcome:
+    """Итог для журнала сайта: что именно сделано с учёткой."""
+
+    def test_provision_outcomes(self) -> None:
+        directory = make_directory()
+        handler = ProvisionHandler(directory, subjects=SUBJECTS, ou_fallback=OU_FALLBACK)
+
+        assert handler.handle(provision_job()).outcome == "created"
+        assert handler.handle(provision_job()).outcome == "updated"
+        DeprovisionHandler(directory, ou_disabled=OU_DISABLED).handle(deprovision_job())
+        assert handler.handle(provision_job()).outcome == "reactivated"
+
+    def test_deprovision_outcomes(self) -> None:
+        directory = make_directory()
+        handler = DeprovisionHandler(directory, ou_disabled=OU_DISABLED)
+
+        assert handler.handle(deprovision_job()).outcome == "absent"
+        directory.create_user(ou_dn=OU_SUBJECT, username="ivanov", first="Иван", last="Иванов")
+        assert handler.handle(deprovision_job()).outcome == "deprovisioned"
+
+    def test_password_outcome_and_failure_has_none(self) -> None:
+        directory = make_directory()
+        handler = PasswordHandler(directory)
+
+        assert handler.handle(password_job()).outcome is None
+        directory.create_user(ou_dn=OU_SUBJECT, username="ivanov", first="Иван", last="Иванов")
+        assert handler.handle(password_job()).outcome == "password_changed"

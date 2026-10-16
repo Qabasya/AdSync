@@ -151,6 +151,23 @@ def test_move_to_ou_moves_and_is_idempotent() -> None:
     assert same_dn == new_dn
 
 
+def test_rename_and_delete_user_in_managed_zone() -> None:
+    gateway = _make_gateway()
+    dn = gateway.create_user(ou_dn=SUBJECT_OU, username="i.petrov", first="Иван", last="Петров")
+
+    renamed = gateway.rename_user(dn, "i.petrov", "Пётр", "Петров", "Сергеевич")
+    assert "Петров" in renamed
+    assert gateway.find_user("i.petrov").dn == renamed  # type: ignore[union-attr]
+    assert gateway.rename_user(renamed, "i.petrov", "Пётр", "Петров", "Сергеевич") == renamed
+
+    gateway.delete_user(renamed)
+    assert gateway.find_user("i.petrov") is None
+    gateway.delete_user(renamed)
+
+    with pytest.raises(OutsideManagedZoneError):
+        gateway.delete_user(OUTSIDE_DN)
+
+
 def test_write_operations_raise_outside_managed_zone() -> None:
     gateway = _make_gateway()
 

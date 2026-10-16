@@ -23,11 +23,13 @@ from api import AppState, create_local_api, create_public_api
 from auth import SignatureVerifier
 from config import Settings, SubjectConfig, load_subjects
 from handlers import (
+    DeleteHandler,
     DeprovisionHandler,
     HandlerResult,
     JobHandler,
     PasswordHandler,
     ProvisionHandler,
+    RenameHandler,
 )
 from jobs import JobProcessor
 from logging_setup import configure_logging
@@ -66,6 +68,8 @@ def _build_ad_gateway(settings: Settings, subjects: dict[str, SubjectConfig]) ->
         ou_disabled=settings.ad_ou_disabled,
         ou_fallback=settings.ad_ou_fallback,
         upn_suffix=settings.ad_upn_suffix,
+        password_never_expires=settings.ad_password_never_expires,
+        profile_path_template=settings.ad_profile_path_template,
     )
 
 
@@ -154,6 +158,8 @@ def main() -> None:
         ),
         "deprovision": DeprovisionHandler(jobs_directory, ou_disabled=settings.ad_ou_disabled),
         "password": PasswordHandler(jobs_directory),
+        "rename": RenameHandler(jobs_directory),
+        "delete": DeleteHandler(jobs_directory),
     }
 
     processor = JobProcessor(handlers=handlers, repository=repository, now=_now)
